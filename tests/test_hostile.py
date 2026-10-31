@@ -404,12 +404,13 @@ def test_zip_member_running_past_the_end(tmp_path):
     p.write_bytes(bytes(data))
     r = bounded(f"""
         import zipfile
-        _orig = zipfile.ZipFile._RealGetContents
-        def _as_before_312(self):  # Python 3.12 added its own overlap check: test without it
-            _orig(self)
-            for zi in self.filelist:
-                zi._end_offset = None
-        zipfile.ZipFile._RealGetContents = _as_before_312
+        if "_end_offset" in zipfile.ZipInfo.__slots__:  # Python 3.12 added its own overlap check: test without it
+            _orig = zipfile.ZipFile._RealGetContents
+            def _as_before_312(self):
+                _orig(self)
+                for zi in self.filelist:
+                    zi._end_offset = None
+            zipfile.ZipFile._RealGetContents = _as_before_312
         report(lambda: bookport.read({str(p)!r}, "htmlz"))
     """)
     assert r["error"] is None or r["bookport"], r
