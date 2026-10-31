@@ -393,6 +393,29 @@ def test_zip_member_over_the_limit(tmp_path, small_limits, fmt):
         bookport.read(p)
 
 
+def test_zip_member_running_past_the_end(tmp_path):
+    """A member whose stated compressed size is bigger than the whole file: Python before 3.12 set
+    aside that many bytes before finding out (a 3 KB file asked for 257 MB on 3.10)."""
+    p = tmp_path / "x.htmlz"
+    _zip(p, {"index.html": b"<html><body><p>Words.</p></body></html>", "style.css": b"p { color: red }"})
+    data = bytearray(p.read_bytes())
+    cd = data.rindex(b"PK\x01\x02")  # the last member's central directory entry
+    data[cd + 20:cd + 24] = struct.pack("<I", 200 * MB)  # its compressed size
+    p.write_bytes(bytes(data))
+    r = bounded(f"""
+        import zipfile
+        _orig = zipfile.ZipFile._RealGetContents
+        def _as_before_312(self):  # Python 3.12 added its own overlap check: test without it
+            _orig(self)
+            for zi in self.filelist:
+                zi._end_offset = None
+        zipfile.ZipFile._RealGetContents = _as_before_312
+        report(lambda: bookport.read({str(p)!r}, "htmlz"))
+    """)
+    assert r["error"] is None or r["bookport"], r
+    assert r["peak_mb"] < 20, r
+
+
 def test_book_budget(tmp_path, small_limits):
     items = b"".join(b'<item id="i%d" href="i%d.css" media-type="text/css"/>' % (k, k) for k in range(4))
     files = {f"i{k}.css": b" " * (800 * 1024) for k in range(4)}

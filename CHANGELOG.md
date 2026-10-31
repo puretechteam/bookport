@@ -2,6 +2,10 @@
 
 Newest first. Work in progress collects under Unreleased until the next release.
 
+## Unreleased
+
+- **Fixed:** on Python 3.10 and 3.11, a damaged ZIP-based book (EPUB, HTMLZ, DOCX and the rest) whose member claims more bytes than the file holds made reading set aside that much memory first: a 3 KB file asked for 257 MB. Such a member is now refused at once as damaged (under 20 MB peak). Python 3.12 and later already caught it.
+
 ## 2026-10-30: bookport 0.1.0
 
 First release: bookport 0.1.0.

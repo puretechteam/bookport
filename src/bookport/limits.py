@@ -121,6 +121,14 @@ def zip_read(z: zipfile.ZipFile, member, limit: int | None = None) -> bytes:
     info = member if isinstance(member, zipfile.ZipInfo) else z.getinfo(member)
     if info.file_size > limit:
         raise _too_big(limit)
+    # A member can't hold more bytes than the file has. Python before 3.12 doesn't check, and reading
+    # sets aside the stated compressed size first: a 3 KB file could ask for hundreds of MB.
+    if z.fp is not None:
+        pos = z.fp.tell()
+        end = z.fp.seek(0, 2)
+        z.fp.seek(pos)
+        if info.header_offset + info.compress_size > end:
+            raise BookportError(f"Damaged ZIP file: {info.filename} runs past the end of the file")
     charge(info.file_size)
     try:
         return z.read(info)
