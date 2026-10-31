@@ -1,0 +1,55 @@
+[build-system]
+requires = ["setuptools>=77"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "bookport"
+dynamic = ["version"]
+description = "Read and write ebooks in every format (EPUB, MOBI, AZW3, PDF, FB2, LIT, LRF, ...) in pure Python. No Calibre, no dependencies."
+readme = "README.md"
+license = "MIT"
+license-files = ["LICENSE"]
+authors = [{ name = "Pure Tech" }]
+requires-python = ">=3.10"
+dependencies = []
+keywords = ["ebook", "epub", "mobi", "azw3", "kindle", "pdf", "fb2", "lit", "lrf", "converter"]
+classifiers = [
+    "Development Status :: 4 - Beta",
+    "Intended Audience :: Developers",
+    "Operating System :: Microsoft :: Windows",
+    "Programming Language :: Python :: 3",
+    "Programming Language :: Python :: 3 :: Only",
+    "Programming Language :: Python :: 3.10",
+    "Programming Language :: Python :: 3.13",
+    "Topic :: Software Development :: Libraries :: Python Modules",
+    "Topic :: Text Processing :: Markup :: HTML",
+]
+
+[project.optional-dependencies]
+images = ["pillow>=10"]
+dev = ["pytest>=8", "ruff>=0.16,<0.17"]
+
+[project.scripts]
+bookport = "bookport.__main__:main"
+
+[project.urls]
+Homepage = "https://github.com/puretechteam/bookport"
+Source = "https://github.com/puretechteam/bookport"
+Issues = "https://github.com/puretechteam/bookport/issues"
+Changelog = "https://github.com/puretechteam/bookport/blob/main/CHANGELOG.md"
+
+[tool.setuptools.dynamic]
+version = { attr = "bookport.__version__" }
+
+[tool.setuptools.packages.find]
+where = ["src"]
+
+[tool.setuptools.package-data]
+bookport = ["fonts/*.ttf", "fonts/*.txt"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+
+[tool.ruff]
+line-length = 130
+target-version = "py310"

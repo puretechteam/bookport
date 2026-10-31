@@ -1,0 +1,16 @@
+__pycache__/
+*.egg-info/
+.venv/
+build/
+dist/
+.pytest_cache/
+.ruff_cache/
+.env*
+!.env.example
+*.key
+*.pem
+*.log
+.DS_Store
+.idea/
+.cache/
+scratch/
