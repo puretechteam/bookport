@@ -27,7 +27,7 @@ classifiers = [
 
 [project.optional-dependencies]
 images = ["pillow>=10"]
-dev = ["pytest>=8", "ruff>=0.16,<0.17"]
+dev = ["pytest>=8", "ruff>=0.16,<0.17", "pymupdf>=1.24", "pillow>=10", "fonttools>=4.50"]  # PyMuPDF and fontTools: independent readers to check output against
 
 [project.scripts]
 bookport = "bookport.__main__:main"
@@ -45,10 +45,12 @@ version = { attr = "bookport.__version__" }
 where = ["src"]
 
 [tool.setuptools.package-data]
-bookport = ["fonts/*.ttf", "fonts/*.txt"]
+bookport = ["fonts/*.ttf.xz", "fonts/*.txt"]
 
 [tool.pytest.ini_options]
 testpaths = ["tests"]
+# Any warning fails a test: each one is either fixed or listed here with the reason.
+filterwarnings = ["error"]
 
 [tool.ruff]
 line-length = 130

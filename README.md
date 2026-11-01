@@ -30,18 +30,18 @@ bookport --formats
 
 ## Why bookport?
 
-Converting ebooks has meant installing Calibre: about 670 MB, GPL, and a program to drive from the outside. bookport is a 3 MB library (most of it the embedded fonts) with nothing else to install, MIT licensed, that runs anywhere Python 3.10+ does and bundles cleanly into an app.
+Converting ebooks has meant installing Calibre: about 670 MB, GPL, and a program to drive from the outside. bookport is a 1.7 MB library (half of it the embedded fonts) with nothing else to install, MIT licensed, that runs anywhere Python 3.10+ does and bundles cleanly into an app.
 
 It was written for [ConvertAll](https://github.com/puretechteam/ConvertAll), a drag-and-drop file converter, to replace Calibre there. It's a sibling of [meshport](https://github.com/puretechteam/meshport) (3D) and [packport](https://github.com/puretechteam/packport) (archives).
 
 ## bookport and Calibre, side by side
 
-Both tools converted the same books on the same Windows 11 machine, one conversion at a time, each in a fresh process (so start-up time counts for both), with Calibre 9.17.0's `ebook-convert` and bookport on Python 3.13. Each pair is **Calibre / bookport**.
+Both tools converted the same books on the same Windows 11 machine, one conversion at a time, each in a fresh process (so start-up time counts for both), with Calibre 9.17.0's `ebook-convert` and bookport on Python 3.13. Each pair is **Calibre / bookport**. The CHM row and the PDF, RB, SNB and LRF rows were measured again for bookport 0.2.0 (the two Standard Ebooks books in their current editions); the other rows are from bookport 0.1.0.
 
 | | Calibre | bookport |
 |---|---|---|
-| Install size | 666.5 MB | **3.0 MB** |
-| Python documentation CHM to EPUB | 381.8 s | **20.5 s** (same 4,171 TOC entries, 100% of Calibre's words) |
+| Install size | 666.5 MB | **1.7 MB** |
+| Python documentation CHM to EPUB | 196.8 s, 7,781 epubcheck errors | **18.0 s**, 0 epubcheck errors (same 4,171 TOC entries, 100% of Calibre's words) |
 
 **From EPUB** (13 books from Project Gutenberg and Standard Ebooks, among them a Chinese novel, poetry, and books with tables, footnotes and pictures):
 
@@ -58,11 +58,11 @@ Both tools converted the same books on the same Windows 11 machine, one conversi
 | eReader PDB | 13/13 / 13/13 | 0.83 / **0.70** | 92 / **42** | 2.43 / 99.92 | 2.41 / 2.87 | 908 / 982 of 986 | 0 / 183 of 189 | 49 / 55 of 84 | 0 / 13 of 13 |
 | PMLZ | 13/13 / 13/13 | 1.63 / **0.77** | 102 / **40** | 2.43 / 99.92 | 2.43 / 2.87 | 975 / 982 of 986 | 183 / 183 of 189 | 26 / 84 of 84 | 13 / 13 of 13 |
 | TCR | 13/13 / 13/13 | 16.70 / **0.59** | 112 / **37** | 99.92 / 99.96 | 99.83 / 99.84 | 908 / 923 of 986 | 0 / 0 of 189 | 49 / 49 of 84 | 0 / 0 of 13 |
-| RB | 13/13 / 13/13 | 1.00 / **0.64** | 97 / **39** | 0.00 / 99.92 | 0.00 / 100.00 | 821 / 979 of 986 | 181 / 183 of 189 | 39 / 39 of 84 | 11 / 13 of 13 |
-| SNB | 13/13 / 13/13 | 1.44 / **0.54** | 105 / **34** | 99.91 / 99.92 | 99.99 / 100.00 | 790 / 985 of 986 | 183 / 183 of 189 | 58 / 58 of 84 | 13 / 13 of 13 |
-| LRF | 13/13 / 13/13 | 1.15 / **0.60** | 104 / **27** | 99.53 / 99.92 | 99.50 / 99.53 | 985 / 985 of 986 | 103 / 183 of 189 | 71 / 71 of 84 | 0 / 13 of 13 |
+| RB | 13/13 / 13/13 | 0.96 / **0.56** | 97 / **37** | 0.00 / 99.92 | 0.00 / 100.00 | 821 / 979 of 986 | 181 / 183 of 189 | 39 / 42 of 84 | 11 / 13 of 13 |
+| SNB | 13/13 / 13/13 | 1.13 / **0.38** | 105 / **34** | 99.91 / 99.92 | 99.99 / 100.00 | 790 / 985 of 986 | 183 / 183 of 189 | 58 / 68 of 84 | 13 / 13 of 13 |
+| LRF | 13/13 / 13/13 | 1.11 / **0.49** | 103 / **27** | 99.53 / 99.92 | 99.50 / 99.53 | 985 / 985 of 986 | 103 / 183 of 189 | 84 / 84 of 84 | 0 / 13 of 13 |
 | LIT | 13/13 / 13/13 | 1.71 / **0.27** | 100 / **30** | 100.00 / 100.00 | 100.00 / 100.00 | 986 / 986 of 986 | 183 / 189 of 189 | 84 / 84 of 84 | 13 / 13 of 13 |
-| PDF | 12/13 / 13/13 | 8.91 / **1.40** | 1138 / **40** | 0.00 / 98.50 | 0.00 / 85.15 | 954 / 986 of 986 | 182 / 183 of 189 | 60 / 81 of 84 | 12 / 13 of 13 |
+| PDF | 13/13 / 13/13 | 5.88 / **1.46** | 1140 / **46** | 98.17 / 98.50 | 81.64 / 85.15 | 986 / 986 of 986 | 183 / 183 of 189 | 65 / 81 of 84 | 13 / 13 of 13 |
 
 **To EPUB** (the Gutenberg and Standard Ebooks Kindle files, and 34 files made from three of the books in the formats that are hard to find on the web: PDF, DOCX, RTF, FB2, eReader, PMLZ, TCR, RB, SNB, LRF, LIT and Plucker):
 
@@ -81,7 +81,7 @@ How to read the columns:
 Where both columns are low, the format is the limit, not the converter:
 
 - Calibre's eReader and PML readers can't read Chinese, so the Chinese novel scores under 3% in the "read by Calibre" column whichever tool wrote it. bookport reads its own files of that book back at 100%.
-- Calibre failed to convert Frankenstein to PDF (exit code 1), which is why its PDF recall is 0.00.
+- In the first measurement Calibre failed to convert Frankenstein to PDF (exit code 1); in the second it converted all 13.
 - Calibre's RB files of two books (the Chinese novel and Les Misérables) gave no text back in either reader.
 
 To run the comparison yourself: `python benchmarks/fetch_corpus.py <folder> --tools` downloads the books and epubcheck, then `python benchmarks/compare_calibre.py <folder>/corpus --from epub --to mobi,pdf --tools <folder>/tools/tools.json --calibre-text` runs it (add `--originals <folder>/corpus` for a folder of files made from those books).
@@ -101,15 +101,15 @@ To run the comparison yourself: `python benchmarks/fetch_corpus.py <folder> --to
 | HTML, HTMLZ | ✓ | ✓ |
 | Plain text, TXTZ, Markdown | ✓ | ✓ |
 | Palm eReader, PalmDOC, zTXT (`.pdb`) | ✓ | ✓ |
-| Plucker (`.pdb`) | ✓ (text and links) | |
+| Plucker (`.pdb`) | ✓ (text, links and pictures) | |
 | PML, PMLZ | ✓ | ✓ |
 | Sony BBeB (LRF) | ✓ | ✓ |
-| Microsoft Reader (LIT) | ✓ | ✓ |
-| Compiled HTML Help (CHM) | ✓ | |
+| Microsoft Reader (LIT) | ✓ (and unpacked) | ✓ |
+| Compiled HTML Help (CHM) | ✓ (and unpacked) | |
 | Rocket eBook (RB) | ✓ | ✓ |
 | Psion TCR | ✓ | ✓ |
 | Shanda Bambook (SNB) | ✓ | ✓ |
-| Comics: CBZ, CBR (stored pages), a folder of images, one image | ✓ (fixed layout) | |
+| Comics: CBZ, CBR (stored pages), a folder of images, one image | ✓ (fixed layout) | ✓ CBZ, from books made of pictures |
 
 Every book goes through one model, `bookport.Book`: metadata (title, authors, language, identifiers, publisher, date, description, subjects, series), a cover, a spine of XHTML documents, resources (images, stylesheets, fonts), a nested table of contents, landmarks and a page list. Anything read can be written to any writable format.
 
@@ -119,7 +119,7 @@ Every book goes through one model, `bookport.Book`: metadata (title, authors, la
 
 **Kindle.** `.mobi` and `.azw` are joint files: a MOBI 6 part for old Kindles (simple HTML made from the book's styled text, with filepos links and an NCX index) and a KF8 part that keeps the book's XHTML and CSS (skeletons and fragments, kindle:pos links, NCX, skeleton, fragment and guide indexes). `.azw3` is KF8 alone. Text is PalmDOC compressed. Reading handles MOBI 6, KF8 and joint files from any tool, HUFF/CDIC compression included.
 
-**PDF writing** is bookport's own typesetter. Text is justified where the book's CSS says so (a line is left ragged rather than stretched past 2.5 times its normal word spacing), lines also break after hyphens and dashes, headings stay with the lines after them, lists hang their markers, tables get measured columns and rows that continue across pages, images are scaled to the page, chapters start on new pages, and the cover gets a page of its own. Fonts are embedded as TrueType subsets (Noto Serif and Noto Sans Mono, OFL) with ToUnicode maps, so the text is searchable and copyable; characters the bundled fonts don't have come from a system font (on Windows, Microsoft YaHei, SimSun, MS Gothic or Malgun Gothic). Links, a bookmark outline from the TOC, page numbers and the metadata are included.
+**PDF writing** is bookport's own typesetter. Text is justified where the book's CSS says so (a line is left ragged rather than stretched past 2.5 times its normal word spacing), lines also break after hyphens and dashes, headings stay with the lines after them, lists hang their markers, tables get measured columns and rows that continue across pages, images are scaled to the page, chapters start on new pages, and the cover gets a page of its own. Letter pairs are kerned as the font's own kerning table says (AV, To, Wa, r. and the rest). Fonts are embedded as TrueType subsets (Noto Serif and Noto Sans Mono, OFL) with ToUnicode maps, so the text is searchable and copyable; characters the bundled fonts don't have come from a system font (on Windows, Microsoft YaHei, SimSun, MS Gothic or Malgun Gothic; on Linux, Droid Sans Fallback, WenQuanYi Zen Hei or DejaVu Sans; on macOS, Arial Unicode). Fonts named in the `BOOKPORT_FALLBACK_FONTS` environment variable are tried first: TrueType files (`.ttf` or `.ttc`), separated by `;` on Windows and `:` elsewhere, which is how to give CJK text a font on a system without one of those. A character no font has is drawn as an empty box and reads back as U+FFFD. Links, a bookmark outline from the TOC, page numbers and the metadata are included.
 
 | `page_size` | Size | `text_size` small / normal / large |
 |---|---|---|
@@ -131,7 +131,7 @@ Every book goes through one model, `bookport.Book`: metadata (title, authors, la
 
 **PDF reading** is bookport's own parser: cross-reference tables and streams, object streams, incremental updates, damaged-file repair, Flate, LZW, ASCII85, ASCIIHex and run-length filters with predictors, RC4 and AES (128 and 256-bit, its own AES) with an empty user password. Page content is interpreted into positioned text (ToUnicode maps, standard encodings with Differences, CID fonts), then reflowed: lines into paragraphs by spacing and indents, larger text into headings, bold and italic kept, running headers, footers and page numbers dropped. A hyphen at the end of a line joins the two halves only if the joined word appears elsewhere in the book, so real compounds like "waistcoat-pocket" keep their hyphen. Images (JPEG as is, others as PNG) and the outline (as the TOC) are kept.
 
-**Other formats.** DOCX reading follows styles (headings from style names and outline levels), numbered and bulleted lists, tables, images, hyperlinks, bookmarks, fields, footnotes and endnotes; writing makes real heading styles, lists, tables, images and internal links. RTF reading handles code pages per font, Unicode escapes, heading styles, tables, pictures, HYPERLINK fields, bookmarks and footnotes. CHM and LIT are decompressed with bookport's own LZX decoder; LIT's tokenized HTML and package are decoded into XHTML, metadata and TOC; LIT writing tokenizes them back, with the documents LZX-framed, a chapter tour from the TOC, the cover and images, and a directory that grows past one chunk for long books. LRF reading and writing cover pages, text blocks, italic and bold, images, the TOC object and the info block. eReader PDB and PMLZ carry the TOC (chapter index and PML headings), links, images and metadata.
+**Other formats.** DOCX reading follows styles (headings from style names and outline levels), numbered and bulleted lists, tables, images, hyperlinks, bookmarks, fields, footnotes and endnotes; writing makes real heading styles, lists, tables, images and internal links. RTF reading handles code pages per font, Unicode escapes, heading styles, tables, pictures, HYPERLINK fields, bookmarks and footnotes. CHM and LIT are decompressed with bookport's own LZX decoder; LIT's tokenized HTML and package are decoded into XHTML, metadata and TOC; LIT writing tokenizes them back, with the documents LZX-framed, a chapter tour from the TOC, the cover and images, and a directory that grows past one chunk for long books. LRF reading and writing cover pages, text blocks, italic and bold, images, the TOC object and the info block. eReader PDB and PMLZ carry the TOC (chapter index and PML headings), links, images and metadata. CBZ writing puts each page's pictures in reading order, with a ComicInfo.xml (title, series, writers, summary, publisher, genres, language, date, right-to-left reading, and the chapters as page bookmarks, which bookport reads back) and the same metadata as ComicBookInfo in the ZIP comment, where calibre's library looks for it; a book whose pages are text is refused, since a comic archive holds only pictures. `bookport.unpack` gives the files inside a CHM or LIT as they are stored (LIT pages in their tokenized form), for tools that extract them: for Python's 9 MB documentation CHM, the same 555 files as 7-Zip, byte for byte.
 
 **Images.** bookport decodes PNG, GIF and BMP itself and writes PNG, so formats that only take some image types get what they need. With Pillow installed it also converts WebP and TIFF.
 
@@ -150,6 +150,7 @@ bookport.read(path, fmt=None) -> Book                 # format from the content,
 bookport.convert(src, dst, fmt=None, **options) -> Path
 bookport.detect(path) -> str                          # "epub", "azw3", "pdf", ...
 bookport.formats() -> dict
+bookport.unpack(path, fmt=None) -> list[(name, bytes)]  # the files inside a CHM or LIT
 
 Book.write(path, fmt=None, **options) -> Path
 Book.metadata, Book.cover, Book.spine, Book.resources, Book.toc, Book.landmarks, Book.page_list
@@ -160,15 +161,17 @@ Options: `page_size`, `text_size` (PDF); `version=2` (EPUB 2), `cover_page=False
 
 ## How it's tested
 
-- **237 tests**, all passing on Python 3.13 with calibre, epubcheck and PyMuPDF installed (the tests that need those skip without them). A sample book with every feature (two authors, series, cover, nested TOC, bold and italic, a list, a table, a figure, an internal link) is written to every format and read back: word recall, TOC entries, images, cover and metadata are checked per format.
+- **300 tests**, all passing on Python 3.13 with calibre and epubcheck installed (the tests that need those skip without them; PyMuPDF and fontTools come with the `dev` extra). Any warning fails a test. A sample book with every feature (two authors, series, cover, nested TOC, bold and italic, a list, a table, a figure, an internal link) is written to every format and read back: word recall, TOC entries, images, cover and metadata are checked per format.
 - **Against calibre 9.17 as an independent reader and writer**, in both directions: calibre reads bookport's EPUB, MOBI, AZW3, FB2, DOCX, RTF, PDF, PDB, PMLZ, TCR, RB, SNB, LRF and LIT output, and bookport reads calibre's output in every format calibre writes, LIT included.
 - **Against epubcheck 5.3.0**: zero errors on EPUBs made from the whole corpus, including from Kindle files.
-- **Against PyMuPDF** for PDF output (text, outline, links, metadata), and its encryption (AES-128, AES-256, RC4) for the PDF reader.
-- **Hand-made files** for the corners: PDFs with filters (ASCII85 + Flate, LZW from the ISO 32000 example), cross-reference streams and object streams, a broken cross-reference table, RC4 encryption at revisions 2 and 3, a password-protected PDF; a CHM, a Plucker file, a stored RAR comic, an ODT, a DOCX with fields and nested numbering, an RTF with code pages, Unicode, fields, footnotes and tables; DRM'd EPUB, Kindle, eReader and comic files.
+- **Against PyMuPDF** for PDF output (text, outline, links, metadata, where each kerned letter sits), and its encryption (AES-128, AES-256, RC4) for the PDF reader.
+- **Against fontTools** for kerning: the pair values bookport reads from the fonts' GPOS tables match fontTools' for all 8,836 pairs of printable ASCII characters in each of the four Noto Serif styles (`test_kerning_matches_fonttools_for_every_ascii_pair`; it skips where fontTools isn't installed, and the `dev` extra installs it).
+- **Against 7-Zip** for `bookport.unpack`: the same 555 files from Python's documentation CHM, byte for byte.
+- **Hand-made files** for the corners: PDFs with filters (ASCII85 + Flate, LZW from the ISO 32000 example), cross-reference streams and object streams, a broken cross-reference table, RC4 encryption at revisions 2 and 3, a password-protected PDF; a CHM, Plucker files with text and pictures, Palm bitmaps in every version, depth and compression, a stored RAR comic, a CBZ with ComicInfo, an ODT, a DOCX with fields and nested numbering, an RTF with code pages, Unicode, fields, footnotes and tables; DRM'd EPUB, Kindle, eReader and comic files.
 - **Codecs**: PalmDOC on random and edge-case data, HUFF/CDIC, Kindle INDX round trips, TCR, LZX, AES against the FIPS-197 test vectors.
 - **Hostile files** (`tests/test_hostile.py`): a file built in code for every limit and safety check above, among them ZIP, zlib, bz2, HUFF/CDIC and LZX bombs, links to absolute, network and far-away paths, CHM, LIT, Kindle and PDF headers with impossible counts, PDF forms that draw themselves, 100,000 nested elements, Markdown that used to backtrack, and XML entity bombs. Files that used to hang run in a child process with a time limit.
-- **Fuzzing** (`tests/test_fuzz.py`): 50 mutants of a sample file in each of 25 formats (flipped bytes, huge header numbers, truncation, repeated and deleted ranges, damage inside ZIP members) must raise only `BookportError`, each within 10 seconds and 256 MB.
-- **A real corpus**: 13 public-domain books from Project Gutenberg and Standard Ebooks (English, French, Chinese; prose, poetry, illustrated, reference), in EPUB, MOBI and AZW3, plus Python's 9 MB CHM documentation and calibre-made files in every rare format.
+- **Fuzzing** (`tests/test_fuzz.py`): 50 mutants of each of 26 sample files (flipped bytes, huge header numbers, truncation, repeated and deleted ranges, damage inside ZIP members) must raise only `BookportError`, each within 10 seconds and 256 MB.
+- **A real corpus**: 13 public-domain books from Project Gutenberg and Standard Ebooks (English, French, Chinese; prose, poetry, illustrated, reference), in EPUB, MOBI and AZW3, plus Python's 9 MB CHM documentation and calibre-made files in every rare format. With `BOOKPORT_CORPUS` set to the folder `benchmarks/fetch_corpus.py` fills, `tests/test_corpus.py` reads every book, checks each Kindle file against its EPUB, sends every book through every writable format and back, runs epubcheck on EPUBs made from every input, and unpacks the CHM against 7-Zip (about 8 minutes).
 
 ## Development
 
@@ -179,7 +182,7 @@ python -m venv .venv
 .venv\Scripts\ruff check .
 ```
 
-Tests that check output with calibre, epubcheck or PyMuPDF skip when those aren't installed. `benchmarks/fetch_corpus.py` downloads the comparison corpus (public-domain books from Project Gutenberg and Standard Ebooks), epubcheck and a portable Java into a scratch folder; `benchmarks/compare_calibre.py` runs the comparison.
+PyMuPDF and Pillow come with the `dev` extra; tests that check output with calibre or epubcheck skip when those aren't installed. `benchmarks/fetch_corpus.py` downloads the comparison corpus (public-domain books from Project Gutenberg and Standard Ebooks), epubcheck and a portable Java into a scratch folder; `benchmarks/compare_calibre.py` runs the comparison.
 
 Code layout:
 

@@ -2,7 +2,8 @@
 
 Written from Apple's TrueType Reference Manual and the OpenType specification: the table
 directory (and TTC collections), head, hhea, hmtx, maxp, cmap (formats 4 and 12), loca, glyf
-(simple and composite glyphs), OS/2, post and name.
+(simple and composite glyphs), OS/2, post and name; and pair kerning from GPOS (the 'kern'
+feature's pair adjustment lookups, formats 1 and 2, also inside extension lookups).
 """
 
 from __future__ import annotations
@@ -34,6 +35,7 @@ class Font:
     name: str = "Font"
     embeddable: bool = True
     _width_cache: dict = field(default_factory=dict)
+    _kerning: Kerning | None = None  # read the first time it's needed
 
     def table(self, tag: str) -> bytes:
         off, length = self.tables[tag]
@@ -50,15 +52,167 @@ class Font:
         return adv[gid] if gid < len(adv) else (adv[-1] if adv else self.units // 2)
 
     def width(self, text: str, size: float) -> float:
-        """Advance width of ``text`` in points at ``size``."""
-        cache = self._width_cache
-        total = 0
-        for ch in text:
-            w = cache.get(ch)
-            if w is None:
-                w = cache[ch] = self.advance(self.cmap.get(ord(ch), 0))
-            total += w
+        """Advance width of ``text`` in points at ``size``, kerned."""
+        cache = self._width_cache  # font units, by character and by word (books repeat their words)
+        total = cache.get(text)
+        if total is None:
+            total = 0
+            for ch in text:
+                w = cache.get(ch)
+                if w is None:
+                    w = cache[ch] = self.advance(self.cmap.get(ord(ch), 0))
+                total += w
+            if len(text) > 1:
+                kerning = self.kerning()
+                if kerning.subtables:
+                    kern = kerning.pair
+                    cmap = self.cmap
+                    prev = cmap.get(ord(text[0]), 0)
+                    for ch in text[1:]:
+                        g = cmap.get(ord(ch), 0)
+                        total += kern(prev, g)
+                        prev = g
+                if len(text) <= 40 and len(cache) < 200_000:
+                    cache[text] = total
         return total * size / self.units
+
+    def kerning(self) -> Kerning:
+        if self._kerning is None:
+            self._kerning = Kerning(self.table("GPOS") if "GPOS" in self.tables and not self.fixed else b"")
+        return self._kerning
+
+
+class Kerning:
+    """The adjustment, in font units, between two glyphs set side by side (GPOS pair adjustment:
+    the first glyph's x advance). A damaged table gives no kerning rather than an error."""
+
+    def __init__(self, gpos: bytes):
+        self.subtables: list[tuple] = []
+        self._cache: dict[tuple[int, int], int] = {}
+        self.runs: dict = {}  # text -> its TJ pieces, for the typesetter
+        try:
+            self._read(gpos)
+        except (struct.error, IndexError, ValueError):
+            self.subtables = []
+
+    def pair(self, first: int, second: int) -> int:
+        key = (first, second)
+        v = self._cache.get(key)
+        if v is None:
+            v = 0
+            for sub in self.subtables:
+                found = _pair_value(sub, first, second)
+                if found is not None:
+                    v = found
+                    break
+            if len(self._cache) < 200_000:
+                self._cache[key] = v
+        return v
+
+    def _read(self, data: bytes):
+        if len(data) < 10:
+            return
+
+        def u16(off):
+            return struct.unpack_from(">H", data, off)[0]
+
+        features, lookups = u16(6), u16(8)
+        wanted: list[int] = []
+        for k in range(u16(features)):
+            if data[features + 2 + 6 * k:features + 6 + 6 * k] == b"kern":
+                feature = features + u16(features + 6 + 6 * k)
+                wanted += [u16(feature + 4 + 2 * j) for j in range(u16(feature + 2))]
+        for index in sorted(set(wanted)):
+            if index >= u16(lookups):
+                continue
+            lookup = lookups + u16(lookups + 2 + 2 * index)
+            kind = u16(lookup)
+            for j in range(u16(lookup + 4)):
+                sub = lookup + u16(lookup + 6 + 2 * j)
+                sub_kind = kind
+                if kind == 9:  # an extension: the real lookup type, then a 32-bit offset
+                    sub_kind = u16(sub + 2)
+                    sub += struct.unpack_from(">I", data, sub + 4)[0]
+                if sub_kind == 2:
+                    parsed = _pair_subtable(data, sub)
+                    if parsed is not None:
+                        self.subtables.append(parsed)
+
+
+def _value_size(fmt: int) -> int:
+    return 2 * (fmt & 0xFF).bit_count()
+
+
+def _x_advance(data: bytes, off: int, fmt: int) -> int:
+    """The XAdvance of a value record (0 when it has none)."""
+    if not fmt & 4:
+        return 0
+    skip = 2 * (fmt & 3).bit_count()  # XPlacement and YPlacement come first
+    return struct.unpack_from(">h", data, off + skip)[0]
+
+
+def _coverage(data: bytes, off: int) -> dict[int, int]:
+    fmt, count = struct.unpack_from(">HH", data, off)
+    if fmt == 1:
+        return {g: k for k, g in enumerate(struct.unpack_from(f">{count}H", data, off + 4))}
+    out = {}
+    for k in range(count):
+        start, end, index = struct.unpack_from(">HHH", data, off + 4 + 6 * k)
+        for g in range(start, end + 1):
+            out[g] = index + g - start
+    return out
+
+
+def _class_def(data: bytes, off: int) -> dict[int, int]:
+    fmt = struct.unpack_from(">H", data, off)[0]
+    if fmt == 1:
+        start, count = struct.unpack_from(">HH", data, off + 2)
+        return {start + k: c for k, c in enumerate(struct.unpack_from(f">{count}H", data, off + 6)) if c}
+    out = {}
+    for k in range(struct.unpack_from(">H", data, off + 2)[0]):
+        start, end, c = struct.unpack_from(">HHH", data, off + 4 + 6 * k)
+        if c:
+            for g in range(start, end + 1):
+                out[g] = c
+    return out
+
+
+def _pair_subtable(data: bytes, off: int) -> tuple | None:
+    fmt, cov, vf1, vf2 = struct.unpack_from(">HHHH", data, off)
+    if not vf1 & 4:
+        return None  # it doesn't change the first glyph's advance
+    coverage = _coverage(data, off + cov)
+    size1, size2 = _value_size(vf1), _value_size(vf2)
+    if fmt == 1:
+        n_sets = struct.unpack_from(">H", data, off + 8)[0]
+        sets = {}
+        for first, index in coverage.items():
+            if index >= n_sets:
+                continue
+            pset = off + struct.unpack_from(">H", data, off + 10 + 2 * index)[0]
+            pairs = {}
+            for k in range(struct.unpack_from(">H", data, pset)[0]):
+                rec = pset + 2 + k * (2 + size1 + size2)
+                pairs[struct.unpack_from(">H", data, rec)[0]] = _x_advance(data, rec + 2, vf1)
+            sets[first] = pairs
+        return (1, sets)
+    if fmt == 2:
+        cd1, cd2, n1, n2 = struct.unpack_from(">HHHH", data, off + 8)
+        rec = size1 + size2
+        matrix = [[_x_advance(data, off + 16 + (c1 * n2 + c2) * rec, vf1) for c2 in range(n2)] for c1 in range(n1)]
+        return (2, set(coverage), _class_def(data, off + cd1), _class_def(data, off + cd2), matrix)
+    return None
+
+
+def _pair_value(sub: tuple, first: int, second: int) -> int | None:
+    if sub[0] == 1:
+        pairs = sub[1].get(first)
+        return pairs.get(second) if pairs is not None else None
+    _fmt, covered, class1, class2, matrix = sub
+    if first not in covered:
+        return None
+    c1, c2 = class1.get(first, 0), class2.get(second, 0)
+    return matrix[c1][c2] if c1 < len(matrix) and c2 < len(matrix[c1]) else 0
 
 
 def load(data: bytes, index: int = 0) -> Font:

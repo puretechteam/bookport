@@ -204,7 +204,8 @@ class HtmlBuilder(HTMLParser):
     def build(self, text: str) -> ET.Element:
         text = _XML_DECL_STR.sub("", text, count=1)
         text = re.sub(r"<!\[CDATA\[(.*?)\]\]>", lambda m: html.escape(m.group(1), quote=False), text, flags=re.DOTALL)
-        self.feed(text)
+        # line breaks as an XML parser leaves them, so a page reads the same whichever parser read it
+        self.feed(text.replace("\r\n", "\n").replace("\r", "\n"))
         self.close()
         root = self.root
         # <html> start tags only merge their attributes into the root

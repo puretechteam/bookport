@@ -47,7 +47,7 @@ FORMATS: dict[str, tuple[str, str, bool, bool]] = {
     "odt": ("odt", "OpenDocument text (ODT)", True, False),
     "rtf": ("rtf", "Rich Text Format", True, True),
     "pdf": ("pdf", "PDF", True, True),
-    "cbz": ("comic", "Comic book ZIP", True, False),
+    "cbz": ("comic", "Comic book ZIP", True, True),
     "cbr": ("comic", "Comic book RAR (stored pages)", True, False),
     "cb7": ("comic", "Comic book 7z", False, False),
     "rb": ("rb", "Rocket eBook (RB)", True, True),
@@ -198,11 +198,44 @@ def read(path: str | os.PathLike, fmt: str | None = None, **options) -> Book:
         except BookportError:
             raise
         except DAMAGE as e:
-            what = ("uses more memory than bookport allows" if isinstance(e, MemoryError) else
-                    "nests too deeply" if isinstance(e, RecursionError) else "is damaged")
-            raise BookportError(f"Can't read {path.name}: the {entry[1]} file {what} "
-                                f"({type(e).__name__}: {str(e)[:120] or 'no details'})") from e
+            raise _damaged(path, entry[1], e) from e
     return book
+
+
+def _damaged(path: Path, kind: str, e: BaseException) -> BookportError:
+    what = ("uses more memory than bookport allows" if isinstance(e, MemoryError) else
+            "nests too deeply" if isinstance(e, RecursionError) else "is damaged")
+    return BookportError(f"Can't read {path.name}: the {kind} file {what} ({type(e).__name__}: {str(e)[:120] or 'no details'})")
+
+
+def unpack(path: str | os.PathLike, fmt: str | None = None) -> list[tuple[str, bytes]]:
+    """The files inside a CHM or LIT container, as (name, data) in the container's own order: the
+    pages, pictures, stylesheets and indexes a help viewer or Microsoft Reader opens (LIT pages are
+    in its tokenized form). Names are as stored, with "/" between folders and no leading "/"; they
+    can hold anything, so make them safe before writing to disk. Folders and the container's own
+    bookkeeping (``::DataSpace/...``) are left out. A LIT with DRM raises DRMError."""
+    path = Path(path)
+    if not path.is_file():
+        raise BookportError(f"No such file: {path}")
+    fmt = (fmt or detect(path)).lower().lstrip(".")
+    if fmt not in ("chm", "lit"):
+        raise BookportError(f"bookport unpacks CHM and LIT files, not {fmt.upper()}")
+    with limits.reading():
+        try:
+            if fmt == "chm":
+                from .fmt.chm import Chm
+                container = Chm(path.read_bytes())
+                get = container.read
+            else:
+                from .fmt.lit import Lit
+                container = Lit(path.read_bytes())
+                get = container.get
+            return [(name[1:], get(name) or b"") for name in container.files
+                    if name.startswith("/") and not name.endswith("/")]
+        except BookportError:
+            raise
+        except DAMAGE as e:
+            raise _damaged(path, FORMATS[fmt][1], e) from e
 
 
 def _finish(book: Book, path: Path) -> None:

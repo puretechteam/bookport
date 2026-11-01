@@ -89,6 +89,8 @@ def read(path) -> Book:
         lang = t("language").lower()
         md.language = {"eng": "en", "zho": "zh", "chs": "zh", "cht": "zh-TW", "fra": "fr", "deu": "de", "jpn": "ja"}.get(lang, lang)
         md.rights, md.publisher, md.description = t("rights"), t("publisher"), t("abstract")
+        if re.match(r"\d{4}(-\d\d){0,2}$", t("created")):
+            md.date = t("created")
         cover_name = t("cover")
     else:
         cover_name = ""

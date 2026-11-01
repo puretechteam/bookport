@@ -1,6 +1,8 @@
 """PDF: the typesetter's output, and the reader on PDFs made by bookport, by hand and by others."""
 
 import hashlib
+import io
+import os
 import re
 import struct
 import zlib
@@ -325,3 +327,158 @@ def test_reader_rejects_garbage(tmp_path):
     p.write_bytes(b"%PDF-1.4\nthis is not really a pdf at all\n%%EOF")
     with pytest.raises(bookport.BookportError):
         bookport.read(p)
+
+
+def test_lines_with_numbers_inside_words_are_kept(tmp_path):
+    # Every line here reads "word# word# ..." once digits are masked, the way running headers are found.
+    # Only whole numbers (page numbers, "Chapter 12") may be masked, or a line at each page edge is lost.
+    import random
+    rnd = random.Random(7)
+    paras = "".join("<p>" + " ".join(f"word{rnd.randrange(4000)}" for _ in range(rnd.randrange(30, 120))) + ".</p>"
+                    for _ in range(300))
+    src = tmp_path / "numbered.html"
+    src.write_text(f"<html><head><title>Numbered</title></head><body>{paras}</body></html>", encoding="utf-8")
+    book = bookport.read(src)
+    out = tmp_path / "numbered.pdf"
+    book.write(out)
+    assert bookport.read(out).word_count() == book.word_count()
+
+
+@needs_pymupdf
+def test_running_headers_and_page_numbers_are_dropped(tmp_path):
+    doc = pymupdf.open()
+    for n in range(1, 9):
+        page = doc.new_page(width=420, height=595)
+        page.insert_text((40, 40), "Annual Report 2024", fontsize=9)
+        for k in range(30):
+            page.insert_text((40, 80 + k * 15), f"Body line {k} of page {n} with the year 1984 in it.", fontsize=10)
+        page.insert_text((190, 570), str(n), fontsize=9)
+    out = tmp_path / "report.pdf"
+    doc.save(out)
+    text = bookport.read(out).text()
+    assert "Annual Report" not in text
+    assert not re.search(r"(?m)^\s*\d+\s*$", text)
+    assert text.count("Body line") == 8 * 30
+
+
+def test_fallback_fonts_from_the_environment(tmp_path, monkeypatch):
+    # The bundled serif has no arrows or maths symbols; BOOKPORT_FALLBACK_FONTS names fonts that do
+    # (on Linux, where the Windows fallbacks don't exist, this is how CJK fonts are given).
+
+    from bookport.pdf import typeset as ts
+    src = tmp_path / "symbols.html"
+    src.write_text("<html><body><p>Arrows ← → and ∀x ∃y.</p></body></html>", encoding="utf-8")
+    book = bookport.read(src)
+    monkeypatch.setattr(ts, "SYSTEM_FALLBACKS", [])
+    font = tmp_path / "fonts" / "mono.ttf"
+    font.parent.mkdir()
+    font.write_bytes(ts.font_bytes("mono"))
+    monkeypatch.setenv("BOOKPORT_FALLBACK_FONTS", os.pathsep.join([str(tmp_path / "missing.ttf"), str(font)]))
+    out = tmp_path / "symbols.pdf"
+    book.write(out)
+    assert "← → and ∀x ∃y" in bookport.read(out).text()
+
+
+def test_characters_no_font_has_read_back_as_unknown(tmp_path, monkeypatch):
+    # They are drawn with the font's empty glyph 0; its text was whichever missing character came first.
+    from bookport.pdf import typeset as ts
+    src = tmp_path / "symbols.html"
+    src.write_text("<html><body><p>Arrows ← → and ∀x ∃y.</p></body></html>", encoding="utf-8")
+    monkeypatch.setattr(ts, "SYSTEM_FALLBACKS", [])
+    monkeypatch.delenv("BOOKPORT_FALLBACK_FONTS", raising=False)
+    out = tmp_path / "symbols.pdf"
+    bookport.read(src).write(out)
+    assert "Arrows \ufffd \ufffd and \ufffdx \ufffdy." in bookport.read(out).text()
+
+
+def test_a_word_that_just_fits_is_not_split():
+    # a table column is exactly as wide as its longest word, give or take a rounding error
+    from bookport.pdf.typeset import Item, Typesetter
+    t = Typesetter(bookport.Book())
+    slot = t.fonts.get("bold")
+    w = slot.font.width("PAGE", 9.9)
+    for avail in (w, w - 1e-12, w * (1 - 1e-15)):
+        lines = t.lines([Item("text", "PAGE", slot, 9.9, w)], avail)
+        assert [[it.text for it in ln.items] for ln in lines] == [["PAGE"]], avail
+
+
+def test_kerning_comes_from_the_fonts_own_table():
+    # values from Noto Serif's GPOS 'kern' feature (all 8,836 printable ASCII pairs of the four serif
+    # styles were checked against fontTools when this was written)
+    from bookport.pdf import ttf
+    from bookport.pdf.typeset import font_bytes
+    serif = ttf.load(font_bytes("regular"))
+    pairs = {p: serif.kerning().pair(serif.glyph(p[0]), serif.glyph(p[1])) for p in ("AV", "To", "r.", "ab", "f)")}
+    assert pairs == {"AV": -80, "To": -50, "r.": -130, "ab": 0, "f)": 90}
+    assert serif.width("AV", 10) == pytest.approx(serif.width("A", 10) + serif.width("V", 10) - 0.8)
+    mono = ttf.load(font_bytes("mono"))
+    assert mono.width("AV", 10) == mono.width("A", 10) + mono.width("V", 10)  # fixed pitch: never kerned
+
+
+@needs_pymupdf
+def test_kerned_glyphs_sit_where_the_layout_put_them(tmp_path):
+    from bookport.pdf import ttf
+    from bookport.pdf.typeset import font_bytes
+    src = tmp_path / "k.html"
+    src.write_text("<html><body><p>AVATAR Tower</p></body></html>", encoding="utf-8")
+    out = tmp_path / "k.pdf"
+    bookport.read(src).write(out)
+    serif = ttf.load(font_bytes("regular"))
+    chars = [c for b in pymupdf.open(out)[0].get_text("rawdict")["blocks"] for ln in b.get("lines", [])
+             for s in ln["spans"] for c in s["chars"]]
+    size = next(s["size"] for b in pymupdf.open(out)[0].get_text("rawdict")["blocks"] for ln in b.get("lines", [])
+                for s in ln["spans"])
+    text = "".join(c["c"] for c in chars)
+    start = text.index("AVATAR")
+    for k in range(start, start + 5):
+        step = chars[k + 1]["origin"][0] - chars[k]["origin"][0]
+        assert step == pytest.approx(serif.width(text[k:k + 2], size) - serif.width(text[k + 1], size), abs=0.02), text[k:k + 2]
+
+
+def _fonttools_pair(subtables, first: str, second: str) -> int:
+    """The first kern subtable's XAdvance for (first, second) glyph names, read by fontTools."""
+    for st in subtables:
+        if first not in st.Coverage.glyphs:
+            continue
+        if st.Format == 1:
+            pairs = st.PairSet[st.Coverage.glyphs.index(first)].PairValueRecord
+            rec = next((r for r in pairs if r.SecondGlyph == second), None)
+            if rec is None:
+                continue
+            return getattr(rec.Value1, "XAdvance", 0) or 0
+        c1 = st.ClassDef1.classDefs.get(first, 0)
+        c2 = st.ClassDef2.classDefs.get(second, 0)
+        return getattr(st.Class1Record[c1].Class2Record[c2].Value1, "XAdvance", 0) or 0
+    return 0
+
+
+@pytest.mark.parametrize("style", ["regular", "bold", "italic", "bolditalic"])
+def test_kerning_matches_fonttools_for_every_ascii_pair(style):
+    fonttools = pytest.importorskip("fontTools.ttLib")
+    from bookport.pdf import ttf
+    from bookport.pdf.typeset import font_bytes
+    data = font_bytes(style)
+    ours = ttf.load(data)
+    font = fonttools.TTFont(io.BytesIO(data))
+    gpos = font["GPOS"].table
+    lookups = sorted({i for fr in gpos.FeatureList.FeatureRecord if fr.FeatureTag == "kern"
+                      for i in fr.Feature.LookupListIndex})
+    subtables = []
+    for i in lookups:
+        lookup = gpos.LookupList.Lookup[i]
+        for st in lookup.SubTable:
+            st = st.ExtSubTable if lookup.LookupType == 9 else st
+            if getattr(st, "ValueFormat1", 0) & 4:  # only those that move the first glyph's advance
+                subtables.append(st)
+    cmap = font.getBestCmap()
+    chars = [chr(c) for c in range(33, 127)]
+    differ, checked = [], 0
+    for a in chars:
+        for b in chars:
+            want = _fonttools_pair(subtables, cmap[ord(a)], cmap[ord(b)])
+            got = ours.kerning().pair(ours.glyph(a), ours.glyph(b))
+            checked += 1
+            if got != want:
+                differ.append((a + b, got, want))
+    assert checked == 8836
+    assert differ == []

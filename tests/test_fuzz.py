@@ -1,6 +1,6 @@
 """Mutation fuzzing over every reader: damaged books may only raise BookportError, quickly and in bounded memory.
 
-A sample book is written to every writable format (plus a CHM, a Plucker file and a comic), then
+A sample book is written to every writable format (plus a CHM, two Plucker files, one with pictures, and a comic), then
 each file is mutated the same way every run (a fixed seed): flipped bytes, big numbers in header
 fields, truncation, repeated and deleted ranges, and for ZIP-based formats the same damage to a
 member inside the archive. Four child processes read the mutants; each read is timed and its peak
@@ -11,6 +11,7 @@ import io
 import json
 import os
 import random
+import struct
 import subprocess
 import sys
 import textwrap
@@ -21,7 +22,7 @@ import bookport
 
 from .conftest import png, sample_book
 from .test_office import _odt
-from .test_rare import _chm, _plucker
+from .test_rare import _bitmap, _chm, _pixel_rows, _plucker, _plucker_pages
 
 SRC = str(Path(bookport.__file__).resolve().parent.parent)
 WRITE = ["epub", "mobi", "azw3", "fb2", "fbz", "html", "htmlz", "txt", "txtz", "md", "docx", "rtf", "pdf", "pdb", "pml",
@@ -49,6 +50,13 @@ WORKER = textwrap.dedent("""
             pass
         except BaseException as e:
             error = f"{type(e).__name__}: {str(e)[:200]}"
+        if fmt in ("chm", "lit") and error is None:
+            try:
+                bookport.unpack(path, fmt)
+            except bookport.BookportError:
+                pass
+            except BaseException as e:
+                error = f"unpack: {type(e).__name__}: {str(e)[:200]}"
         print(json.dumps({"path": path, "error": error, "seconds": time.perf_counter() - t,
                           "peak_mb": tracemalloc.get_traced_memory()[1] / 2**20}), flush=True)
 """)
@@ -63,6 +71,11 @@ def _seeds(tmp: Path) -> dict[str, bytes]:
     out["chm"] = _chm({"/a.htm": b"<html><head><title>A</title></head><body><p>Alpha <a href='b.htm'>b</a></p></body></html>",
                        "/b.htm": b"<html><body><p>Beta <img src='i.png'></p></body></html>", "/i.png": png()})
     out["plucker"] = _plucker([[b"First paragraph.", b"Second one."], [b"Another page."]])
+    pic = _bitmap(13, 5, 4, _pixel_rows([[x % 16 for x in range(13)]] * 5, 13, 4), compression="scanline")
+    text = b"A picture \x00\x1a\x00\x05 and a grid \x00\x1a\x00\x06."
+    out["plucker-images"] = _plucker_pages([struct.pack(">HHHBB", 2, 1, len(text), 0, 0) + struct.pack(">HH", len(text), 0) + text,
+                                            struct.pack(">HHHBB", 5, 0, len(pic), 2, 0) + pic,
+                                            struct.pack(">HHHBB", 6, 0, 8, 15, 0) + struct.pack(">HHHH", 2, 1, 5, 5)])
     buf = io.BytesIO()
     with zipfile.ZipFile(buf, "w") as z:
         z.writestr("001.png", png())
@@ -121,7 +134,7 @@ def test_mutated_books_only_raise_bookport_error(tmp_path):
     rng = random.Random(20261030)
     jobs = []
     for fmt, data in _seeds(tmp_path).items():
-        read_as = {"plucker": "pdb", "md": "md"}.get(fmt, fmt)
+        read_as = {"plucker": "pdb", "plucker-images": "pdb", "md": "md"}.get(fmt, fmt)
         for k in range(MUTANTS):
             mutant = _mutate_member(data, rng) if fmt in ZIPPED and k % 2 else _mutate(data, rng)
             p = tmp_path / f"m{k:02d}.{fmt}"

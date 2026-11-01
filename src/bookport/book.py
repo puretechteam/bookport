@@ -252,6 +252,9 @@ class Book:
         for href, res in self.resources.items():
             r = b.add(href, res.data, res.media_type, unique=False)
             r.properties, r.id = res.properties, res.id
+            cached = self._trees.get(href)
+            if cached is not None and cached[0] is res.data:  # a copy of the parsed tree beats parsing again
+                b._trees[r.href] = (r.data, _copy.deepcopy(cached[1]))
         b.spine = [h for h in self.spine if h in b.resources]
         b.toc = _copy.deepcopy(self.toc)
         b.landmarks = _copy.deepcopy(self.landmarks)

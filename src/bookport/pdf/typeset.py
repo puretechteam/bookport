@@ -12,6 +12,7 @@ from __future__ import annotations
 
 import datetime
 import hashlib
+import lzma
 import os
 import re
 import struct
@@ -34,8 +35,10 @@ MARGINS = {"phone": (16, 14, 18, 14), "ereader": (16, 16, 18, 16), "a5": (42, 40
 TEXT_SIZES = {"phone": (8.5, 10.0, 12.0), "ereader": (8.5, 10.0, 12.0), "a5": (9.5, 11.0, 13.0), "a4": (10.0, 12.0, 14.0),
               "letter": (10.0, 12.0, 14.0)}
 FONT_DIR = Path(__file__).resolve().parent.parent / "fonts"
-FONT_FILES = {"regular": "NotoSerif-Regular.ttf", "bold": "NotoSerif-Bold.ttf", "italic": "NotoSerif-Italic.ttf",
-              "bolditalic": "NotoSerif-BoldItalic.ttf", "mono": "NotoSansMono-Regular.ttf"}
+# stored xz-compressed, without the tables bookport doesn't read (tools/slim_fonts.py): 0.86 MB, not 2.4
+FONT_FILES = {"regular": "NotoSerif-Regular.ttf.xz", "bold": "NotoSerif-Bold.ttf.xz",
+              "italic": "NotoSerif-Italic.ttf.xz", "bolditalic": "NotoSerif-BoldItalic.ttf.xz",
+              "mono": "NotoSansMono-Regular.ttf.xz"}
 # glyf-outline system fonts that cover scripts the bundled fonts don't (CJK, symbols)
 SYSTEM_FALLBACKS = [
     "C:/Windows/Fonts/msyh.ttc", "C:/Windows/Fonts/simsun.ttc", "C:/Windows/Fonts/msgothic.ttc", "C:/Windows/Fonts/malgun.ttf",
@@ -65,6 +68,11 @@ class Slot:
         self.ref: Ref | None = None
 
 
+def font_bytes(style: str) -> bytes:
+    """A bundled font, as a TrueType file."""
+    return lzma.decompress((FONT_DIR / FONT_FILES[style]).read_bytes())
+
+
 class Fonts:
     def __init__(self):
         self.slots: dict[str, Slot] = {}
@@ -73,8 +81,7 @@ class Fonts:
 
     def get(self, style: str) -> Slot:
         if style not in self.slots:
-            data = (FONT_DIR / FONT_FILES[style]).read_bytes()
-            self.slots[style] = Slot(f"F{len(self.slots) + 1}", ttf.load(data))
+            self.slots[style] = Slot(f"F{len(self.slots) + 1}", ttf.load(font_bytes(style)))
         return self.slots[style]
 
     def fallbacks(self) -> list[Slot]:
@@ -357,11 +364,11 @@ class Typesetter:
                     finish(False)
                     extra = 0.0
                     pending_space = None
-                if w > avail and not line:
+                if w > avail + 0.01 and not line:
                     # a word longer than the line: break it between characters
                     for it in word:
-                        if it.kind != "text" or it.width <= avail:
-                            if line and line_w + it.width > avail:
+                        if it.kind != "text" or it.width <= avail + 0.01:
+                            if line and line_w + it.width > avail + 0.01:
                                 finish(False)
                             line.append(it)
                             line_w += it.width
@@ -369,7 +376,7 @@ class Typesetter:
                         chunk = ""
                         for ch in it.text:
                             cw = it.slot.font.width(chunk + ch, it.size)
-                            if line_w + cw > avail and (chunk or line):
+                            if line_w + cw > avail + 0.01 and (chunk or line):
                                 if chunk:
                                     line.append(Item("text", chunk, it.slot, it.size, it.slot.font.width(chunk, it.size),
                                                      it.rise, it.color, it.underline, it.strike, it.href, it.anchors))
@@ -466,10 +473,12 @@ class Typesetter:
                     text_ops.append(b"1 0 0 1 %s %s Tm\n" % (_fmt(x), _fmt(baseline)))
                     state["placed"] = True
                 glyphs = self.encode(it.slot, it.text)
-                if tj and tj[-1][:1] == b"<":
-                    tj[-1] = tj[-1][:-1] + glyphs + b">"  # one string for a run of glyphs with no kern between
-                else:
-                    tj.append(b"<" + glyphs + b">")
+                kerned = self.kerned(it.slot.font, it.text, glyphs) if len(it.text) > 1 else None
+                for part in kerned or (b"<" + glyphs + b">",):
+                    if part[:1] == b"<" and tj and tj[-1][:1] == b"<":
+                        tj[-1] = tj[-1][:-1] + part[1:]  # one string for a run of glyphs with no kern between
+                    else:
+                        tj.append(part)
                 if it.kind == "space" and gap:
                     tj.append(_fmt(-gap * 1000 / it.size))
             if it.underline or it.strike:
@@ -489,9 +498,40 @@ class Typesetter:
         for ch in text:
             gid = font.cmap.get(ord(ch), 0)
             if gid not in slot.used:
-                slot.used[gid] = ch
+                slot.used[gid] = ch if gid else "\ufffd"  # glyph 0 stands for every character the font lacks
             out.append(b"%04X" % gid)
         return b"".join(out)
+
+    @staticmethod
+    def kerned(font: ttf.Font, text: str, glyphs: bytes) -> list[bytes] | None:
+        """TJ array elements for text encoded as glyphs: glyph strings with the font's kerning between
+        pairs as numbers (thousandths of the font size, positive moving the next glyph left), as
+        Font.width measures it; None when no pair in it is kerned."""
+        kerning = font.kerning()
+        if not kerning.subtables:
+            return None
+        done = kerning.runs.get(text, False)  # books repeat their words
+        if done is not False:
+            return done
+        kern = kerning.pair
+        cmap = font.cmap
+        parts = None
+        start = 0
+        prev = cmap.get(ord(text[0]), 0)
+        for k in range(1, len(text)):
+            g = cmap.get(ord(text[k]), 0)
+            adjust = kern(prev, g)
+            if adjust:
+                if parts is None:
+                    parts = []
+                parts += [b"<" + glyphs[4 * start:4 * k] + b">", _fmt(-adjust * 1000 / font.units)]
+                start = k
+            prev = g
+        if parts is not None:
+            parts.append(b"<" + glyphs[4 * start:] + b">")
+        if len(kerning.runs) < 100_000:
+            kerning.runs[text] = parts
+        return parts
 
     # --- blocks ----------------------------------------------------------------------------------
     def paragraph(self, b: flowmod.Block, size: float, x0: float, width: float, mono=False):

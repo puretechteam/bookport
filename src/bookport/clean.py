@@ -489,6 +489,10 @@ class Cleaner:
             c.tail = None
             if c.tag in order:
                 heads.append(c)
+            elif c.tag == "col":  # a <col> straight in the table belongs to a colgroup, as HTML parsers make it
+                if not heads or heads[-1].tag != "colgroup" or heads[-1].get("data-made") != "1":
+                    heads.append(ET.Element("colgroup", {"data-made": "1"}))
+                heads[-1].append(c)
             elif c.tag == "tfoot":
                 tails.append(c)
             elif c.tag in ("tbody", "tr"):
@@ -504,6 +508,18 @@ class Cleaner:
                 tr = ET.Element("tr")
                 tr.append(cell)
                 others.append(tr)
+        # rows may sit straight in a table or in row groups, not both: runs of loose rows get a tbody
+        if any(c.tag == "tr" for c in others) and (any(c.tag == "tbody" for c in others) or tails or
+                                                   any(c.tag == "thead" for c in heads)):
+            grouped = []
+            for c in others:
+                if c.tag == "tr":
+                    if not grouped or grouped[-1].get("data-made") != "1":
+                        grouped.append(ET.Element("tbody", {"data-made": "1"}))
+                    grouped[-1].append(c)
+                else:
+                    grouped.append(c)
+            others = grouped
         # caption must come first
         heads.sort(key=lambda e: order[e.tag])
         for c in heads + others + tails:
@@ -645,7 +661,8 @@ class Cleaner:
         if v.lower().startswith("javascript:"):
             return None
         if is_external(v):
-            return v.replace(" ", "%20")
+            # a "%" that doesn't start an escape (#%_sec) makes the URL invalid: escape it
+            return re.sub(r"%(?![0-9A-Fa-f]{2})", "%25", v.replace(" ", "%20"))
         doc, _, frag = v.partition("#")
         target = resolve(href, doc) if doc else href
         if target not in self.book.resources:

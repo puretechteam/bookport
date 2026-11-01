@@ -8,6 +8,7 @@ including right-to-left reading for manga.
 from __future__ import annotations
 
 import io
+import json
 import posixpath
 import re
 import struct
@@ -15,7 +16,7 @@ import xml.etree.ElementTree as ET
 import zipfile
 from pathlib import Path
 
-from .. import limits, markup
+from .. import __version__, limits, markup
 from ..book import IMAGE_EXT, Book, Metadata, TocEntry, sniff_image
 from ..errors import BookportError, DRMError
 
@@ -70,8 +71,7 @@ def build(entries, title: str) -> Book:
         pages.append((name, data, mt))
     if not pages:
         raise BookportError("This comic has no pages (no images found)")
-    if info:
-        _comic_info(book, info)
+    marks = _comic_info(book, info) if info else []
     from .epub import image_size
     folders: dict[str, str] = {}
     toc: list[TocEntry] = []
@@ -92,15 +92,18 @@ def build(entries, title: str) -> Book:
             toc.append(TocEntry(posixpath.basename(folder).replace("_", " "), href))
         if n == 1:
             book.cover = img
-    book.toc = toc if len(toc) > 1 else [TocEntry(book.metadata.title or "Start", book.spine[0])]
+    bookmarked = [TocEntry(title, book.spine[i]) for i, title in marks if i < len(book.spine)]
+    if bookmarked:
+        toc = bookmarked
+    book.toc = toc if len(toc) > 1 or bookmarked else [TocEntry(book.metadata.title or "Start", book.spine[0])]
     return book
 
 
-def _comic_info(book: Book, data: bytes) -> None:
+def _comic_info(book: Book, data: bytes) -> list[tuple[int, str]]:
     try:
         root = markup.parse_xml(data, "ComicInfo.xml")
     except ET.ParseError:
-        return
+        return []
 
     def t(tag):
         el = root.find(tag)
@@ -132,6 +135,129 @@ def _comic_info(book: Book, data: bytes) -> None:
             f"-{int(t('Day')):02d}" if t("Day").isdigit() and t("Month").isdigit() else "")
     if t("Manga").lower() == "yesandrighttoleft":
         book.direction = "rtl"
+    # ComicRack's page bookmarks: (page index, chapter title)
+    marks = []
+    for page in root.iterfind("Pages/Page"):
+        title = " ".join(page.get("Bookmark", "").split())
+        if title and page.get("Image", "").isdigit():
+            marks.append((int(page.get("Image")), title))
+    return marks
+
+
+# --- writing ------------------------------------------------------------------------------------
+
+WRITES = {"image/jpeg", "image/png", "image/gif", "image/webp", "image/bmp"}  # the pictures comic readers show
+TEXT_PAGE_WORDS = 40  # more words than this and a page is text, not a picture with a caption
+
+
+def write(book: Book, path) -> None:
+    """CBZ: each page's pictures in reading order (0001.jpg, 0002.png, ...) and a ComicInfo.xml with
+    the title, series, writers, summary, publisher, genres, language, date, reading direction and
+    the TOC as page bookmarks. Pages of text can't become pictures, so a book with them is refused."""
+    from ..book import resolve
+    pictures: list[str] = []
+    first_picture: dict[str, int] = {}
+    text_pages = []
+    for href, _res in book.documents():
+        body = book.tree(href).find("body")
+        if body is None:
+            continue
+        if _words(body) > TEXT_PAGE_WORDS:
+            text_pages.append(href)
+            continue
+        for el in body.iter():
+            if el.tag not in ("img", "image"):
+                continue
+            target = resolve(href, el.get("src") or el.get("xlink:href") or el.get("href") or "")
+            res = book.resources.get(target)
+            if res is not None and res.media_type in WRITES and target not in pictures:
+                first_picture.setdefault(href, len(pictures))
+                pictures.append(target)
+    if text_pages:
+        raise BookportError(f"A comic book archive holds only pictures, and {len(text_pages)} page(s) of this book are "
+                            "text: write it as PDF or EPUB instead")
+    cover = book.resources.get(book.cover) if book.cover else None
+    if cover is not None and cover.media_type in WRITES and book.cover not in pictures:
+        pictures.insert(0, book.cover)
+        first_picture = {k: v + 1 for k, v in first_picture.items()}
+    if not pictures:
+        raise BookportError("This book has no pictures to make a comic of")
+    marks: dict[int, str] = {}
+    for _depth, e in book.toc_walk():
+        page = first_picture.get(e.href.split("#")[0])
+        if page is not None and e.title.strip():
+            marks.setdefault(page, " ".join(e.title.split()))
+    with zipfile.ZipFile(path, "w", zipfile.ZIP_STORED) as z:  # pictures are compressed already
+        for n, href in enumerate(pictures, 1):
+            res = book.resources[href]
+            z.writestr(f"{n:04d}{IMAGE_EXT[res.media_type]}", res.data)
+        z.writestr("ComicInfo.xml", _comic_info_xml(book, len(pictures), marks), zipfile.ZIP_DEFLATED)
+        z.comment = _comic_book_info(book)
+
+
+def _comic_book_info(book: Book) -> bytes:
+    """The same metadata as ComicBookInfo 1.0 JSON in the ZIP comment, which calibre and other
+    library tools read instead of ComicInfo.xml (a ZIP comment holds at most 65,535 bytes)."""
+    md = book.metadata
+    info: dict = {"title": md.title, "series": md.series, "publisher": md.publisher, "comments": md.description,
+                  "language": md.language, "genre": ", ".join(md.subjects), "tags": md.subjects,
+                  "credits": [{"person": a, "role": "Writer", "primary": True} for a in md.authors]}
+    if md.series and md.series_index is not None:
+        info["issue"] = f"{md.series_index:g}"
+    date = re.match(r"(\d{4})(?:-(\d\d))?", md.date or "")
+    if date:
+        info["publicationYear"] = int(date[1])
+        if date[2]:
+            info["publicationMonth"] = int(date[2])
+    info = {k: v for k, v in info.items() if v}
+    data = json.dumps({"appID": f"bookport/{__version__}", "ComicBookInfo/1.0": info}, ensure_ascii=False).encode()
+    if len(data) > 0xFFFF:  # a very long summary: leave it out
+        info.pop("comments", None)
+        data = json.dumps({"appID": f"bookport/{__version__}", "ComicBookInfo/1.0": info}, ensure_ascii=False).encode()
+    return data if len(data) <= 0xFFFF else b""
+
+
+def _words(body: ET.Element) -> int:
+    n = 0
+    for el in body.iter():
+        if el.tag not in ("style", "script"):
+            n += len(re.findall(r"\w+", el.text or ""))
+        if el is not body:
+            n += len(re.findall(r"\w+", el.tail or ""))
+    return n
+
+
+def _comic_info_xml(book: Book, pages: int, marks: dict[int, str]) -> bytes:
+    md = book.metadata
+    root = ET.Element("ComicInfo")
+
+    def add(tag, value):
+        if value:
+            ET.SubElement(root, tag).text = str(value)
+
+    # in the order ComicInfo's schema lists them
+    add("Title", md.title)
+    add("Series", md.series)
+    if md.series and md.series_index is not None:
+        add("Number", f"{md.series_index:g}")
+    add("Summary", md.description)
+    date = re.match(r"(\d{4})(?:-(\d\d)(?:-(\d\d))?)?", md.date or "")
+    if date:
+        add("Year", int(date[1]))
+        add("Month", int(date[2]) if date[2] else "")
+        add("Day", int(date[3]) if date[3] else "")
+    add("Writer", ", ".join(md.authors))
+    add("Publisher", md.publisher)
+    add("Genre", ", ".join(md.subjects))
+    add("PageCount", pages)
+    add("LanguageISO", md.language)
+    if book.direction == "rtl":
+        add("Manga", "YesAndRightToLeft")
+    if marks:
+        listing = ET.SubElement(root, "Pages")
+        for index, title in sorted(marks.items()):
+            ET.SubElement(listing, "Page", {"Image": str(index), "Bookmark": title})
+    return b'<?xml version="1.0" encoding="utf-8"?>\n' + ET.tostring(root, encoding="utf-8")
 
 
 # --- RAR, stored only (from RARLAB's technote) ------------------------------------------------

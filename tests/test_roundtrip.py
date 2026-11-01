@@ -76,6 +76,10 @@ def test_every_writable_format_writes(book, tmp_path):
         if fmt in ("fbz",):
             continue
         out = tmp_path / f"b.{fmt}"
+        if fmt == "cbz":  # a comic archive holds only pictures: a book of text is refused (test_office has comics)
+            with pytest.raises(bookport.BookportError, match="only pictures"):
+                book.write(out, fmt)
+            continue
         book.write(out, fmt)
         assert out.stat().st_size > 0, fmt
 
@@ -144,3 +148,40 @@ def test_epub_guide_and_ncx_stay_valid(book, tmp_path):
 @needs_epubcheck
 def test_epubcheck_passes(book, tmp_path):
     assert epubcheck_errors(_tricky_epub(book, tmp_path)) == []
+
+
+TABLES = ('<table><col class="a"><col class="b"><tbody><tr><th>Release:</th><td>3.10</td></tr></tbody></table>'
+          '<table><tr><td>loose row</td></tr><tbody><tr><td>in a body</td></tr></tbody><tr><td>loose again</td></tr></table>')
+
+
+def _tables_after_cleaning(tmp_path):
+    src = tmp_path / "t.html"
+    src.write_text(f"<html><body><p>Tables:</p>{TABLES}</body></html>", encoding="utf-8")
+    out = bookport.read(src).write(tmp_path / "t.epub")
+    back = bookport.read(out)
+    return out, [t for href in back.spine for t in back.tree(href).iter("table")]
+
+
+def test_bare_cols_and_loose_rows_make_a_valid_table(tmp_path):
+    # Sphinx (Python's documentation) puts <col> straight in <table>; they were wrapped in rows and cells
+    _out, (first, second) = _tables_after_cleaning(tmp_path)
+    assert [c.tag for c in first] == ["colgroup", "tbody"]
+    assert [c.get("class") for c in first.find("colgroup")] == ["a", "b"]
+    assert [c.tag for c in second] == ["tbody", "tbody", "tbody"]  # rows never sit beside a tbody
+    assert "".join(second.itertext()) == "loose rowin a bodyloose again"
+
+
+@needs_epubcheck
+def test_bare_cols_and_loose_rows_pass_epubcheck(tmp_path):
+    out, _tables = _tables_after_cleaning(tmp_path)
+    assert epubcheck_errors(out) == []
+
+
+def test_a_stray_percent_in_a_web_link_is_escaped(tmp_path):
+    # Python's documentation links to "...r5rs-Z-H-9.html#%_sec_6.2", which isn't a valid URL in an EPUB
+    src = tmp_path / "l.html"
+    src.write_text('<html><body><p><a href="https://example.org/r5rs.html#%_sec_6.2">R5RS</a> '
+                   '<a href="https://example.org/a%20b?q=100%25">ok</a></p></body></html>', encoding="utf-8")
+    back = bookport.read(bookport.read(src).write(tmp_path / "l.epub"))
+    hrefs = [a.get("href") for h in back.spine for a in back.tree(h).iter("a")]
+    assert hrefs == ["https://example.org/r5rs.html#%25_sec_6.2", "https://example.org/a%20b?q=100%25"]

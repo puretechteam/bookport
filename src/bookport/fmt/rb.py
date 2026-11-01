@@ -53,6 +53,10 @@ def read(path) -> Book:
     book = Book(Metadata(title=info.get("TITLE", Path(path).stem), authors=[a.strip() for a in
                                                                            info.get("AUTHOR", "").split(";") if a.strip()]))
     book.source_format = "rb"
+    md = book.metadata
+    md.publisher, md.rights = info.get("PUBLISHER", ""), info.get("COPYRIGHT", "")
+    if info.get("ISBN"):
+        md.identifiers["isbn"] = info["ISBN"]
     images = {}
     for name in order:
         if sniff_image(entries[name]):
@@ -138,7 +142,12 @@ def write(book: Book, path, **_) -> None:
     parts.append("</BODY></HTML>")
     html = "\n".join(parts).encode("cp1252", "xmlcharrefreplace")
     md = book.metadata
-    info = f"TYPE=2\nTITLE={md.title}\nAUTHOR={'; '.join(md.authors)}\nGENERATOR=bookport\nBODY=index.html\n"
+    info = f"TYPE=2\nTITLE={md.title}\nAUTHOR={'; '.join(md.authors)}\n"
+    # the other keys a Rocket eBook's info page has
+    for key, value in (("PUBLISHER", md.publisher), ("COPYRIGHT", md.rights), ("ISBN", md.identifiers.get("isbn", ""))):
+        if value:
+            info += f"{key}={' '.join(value.split())}\n"
+    info += "GENERATOR=bookport\nBODY=index.html\n"
     files = [("info.info", info.encode("cp1252", "replace"), 2), ("index.html", _deflate(html), 8)]
     for href, name in names.items():
         data = book.resources[href].data

@@ -152,7 +152,9 @@ def read(path) -> Book:
     md.publisher = info.get("Publisher", "") if info.get("Publisher") != "Unknown" else ""
     md.language = info.get("Language", "")
     if info.get("Category"):
-        md.subjects = [info["Category"]]
+        md.subjects = [c.strip() for c in info["Category"].split(",") if c.strip()]
+    if re.match(r"\d{4}(-\d\d){0,2}$", info.get("CreationDate", "")):
+        md.date = info["CreationDate"]
     if info.get("FreeText"):
         md.description = info["FreeText"]
     if info.get("BookID"):
@@ -468,7 +470,7 @@ def write(book: Book, path, **_) -> None:
             f"<Author reading=\"{markup._esc_attr(md.author_sort or '')}\">{markup.escape(' & '.join(md.authors))}</Author>\n"
             f"<BookID>{markup.escape(md.uid().replace('-', '')[:32])}</BookID>\n"
             f"<Publisher reading=\"\">{markup.escape(md.publisher)}</Publisher>\n<Label reading=\"\" />\n"
-            f"<Category>{markup.escape(md.subjects[0] if md.subjects else '')}</Category>\n<Classification />\n"
+            f"<Category>{markup.escape(', '.join(md.subjects))}</Category>\n<Classification />\n"
             f"<FreeText>{markup.escape(re.sub(r'<[^>]+>', '', md.description))}</FreeText>\n</BookInfo>\n<DocInfo>\n"
             f"<Language>{markup.escape(md.language or 'en')}</Language>\n<Creator />\n"
             f"<CreationDate>{markup.escape(md.date[:10])}</CreationDate>\n<Producer>bookport</Producer>\n"

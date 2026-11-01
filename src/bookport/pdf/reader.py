@@ -567,11 +567,12 @@ def lines_of(pc: PageContent, page_index: int) -> list[TextLine]:
 
 
 def _strip_furniture(pages: list[list[TextLine]], heights: list[float]) -> None:
-    """Drop page numbers and running headers/footers."""
+    """Drop page numbers and running headers/footers. Lines are compared with whole numbers masked
+    ("Chapter 12" and "Chapter 13" match); digits inside a word ("A320", "1880s") stay."""
     counts: Counter = Counter()
     for lines in pages:
         for ln in lines[:2] + lines[-2:]:
-            counts[re.sub(r"\d+", "#", ln.text.strip().lower())] += 1
+            counts[re.sub(r"\b\d+\b", "#", ln.text.strip().lower())] += 1
     n = len(pages)
     for i, lines in enumerate(pages):
         h = heights[i]
@@ -580,7 +581,7 @@ def _strip_furniture(pages: list[list[TextLine]], heights: list[float]) -> None:
             t = ln.text.strip()
             edge = ln.y > h * 0.9 or ln.y < h * 0.1
             near_end = k < 2 or k >= len(lines) - 2
-            norm = re.sub(r"\d+", "#", t.lower())
+            norm = re.sub(r"\b\d+\b", "#", t.lower())
             if edge and near_end and (re.fullmatch(r"[\divxlcdm\s\-–—.]*", t.lower()) and len(t) < 12
                                       or n >= 6 and counts[norm] >= max(3, n * 0.3) and len(t) < 90):
                 continue

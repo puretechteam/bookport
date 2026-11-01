@@ -312,3 +312,255 @@ def test_tcr_keeps_text_outside_windows_1252(tmp_path):
     out = tmp_path / "g.tcr"
     book.write(out)
     assert "τὰ πρὸς ἑαυτόν" in bookport.read(out).text()
+
+
+def test_unpack_chm(tmp_path):
+    p = tmp_path / "h.chm"
+    files = {"/a.htm": b"<html><body><p>First</p></body></html>", "/pics/": b"", "/pics/i.png": png(), "/#SYSTEM": b"\3\0\0\0",
+             "/empty.txt": b"", "::DataSpace/NameList": b"\0\0"}
+    p.write_bytes(_chm(files))
+    assert bookport.unpack(p) == [("#SYSTEM", b"\3\0\0\0"), ("a.htm", files["/a.htm"]), ("empty.txt", b""),
+                                  ("pics/i.png", png())]
+
+
+def test_unpack_lit(tmp_path):
+    book = _many_chapters(3)
+    book.add("images/pic.png", png(), "image/png")
+    out = tmp_path / "b.lit"
+    book.write(out)
+    files = dict(bookport.unpack(out))
+    assert png() in files.values()  # pictures are stored as they are
+    assert files.get("meta")  # the package, tokenized
+    contents = [name for name in files if name.endswith("/content")]
+    assert len(contents) >= 3 and all(files[n] for n in contents)  # pages, from the LZX section
+    assert not any(n.startswith(("/", "::")) or n.endswith("/") for n in files)
+
+
+def test_unpack_refuses_drm_and_other_formats(tmp_path, monkeypatch):
+    from bookport.fmt.lit import Lit
+    out = tmp_path / "b.lit"
+    _many_chapters(1).write(out)
+    monkeypatch.setattr(Lit, "_names", lambda self: ["Uncompressed", "EbEncryptDS"])  # the pages in an encrypted section
+    with pytest.raises(bookport.DRMError):
+        bookport.unpack(out)
+    epub = _many_chapters(1).write(tmp_path / "b.epub")
+    with pytest.raises(bookport.BookportError, match="unpacks CHM and LIT"):
+        bookport.unpack(epub)
+    with pytest.raises(bookport.BookportError, match="No such file"):
+        bookport.unpack(tmp_path / "missing.chm")
+
+
+# --- Palm bitmaps (Plucker images), built from the format description --------------------------
+
+def _bitmap(width, height, depth, rows: list[bytes], version=2, flags=0, compression=None, palette=None,
+            transparent=0, direct=None, next_off=0):
+    """One Palm bitmap; rows are the packed pixel rows (padded to row_bytes); compression None is
+    stored, else "scanline", "rle" or "packbits"."""
+    row_bytes = len(rows[0])
+    raw = b"".join(rows)
+    if palette is not None:
+        flags |= 0x4000
+    if compression is not None:
+        flags |= 0x8000
+        kind = {"scanline": 0, "rle": 1, "packbits": 2}[compression]
+        packed = {"scanline": _scanline, "rle": _rle, "packbits": _packbits}[compression](raw, row_bytes, depth)
+        size = 4 if version >= 3 else 2
+        body = (len(packed) + size).to_bytes(size, "big") + packed
+    else:
+        kind = 0xFF if version >= 2 else 0
+        body = raw
+    if version >= 3:
+        head = struct.pack(">HHHHBBBBBBHII", width, height, row_bytes, flags, depth, 3, 24, 2 if depth == 16 else 0, 0,
+                           kind, 72, transparent, next_off)
+    else:
+        head = struct.pack(">HHHHBBHBBH", width, height, row_bytes, flags, depth, version, next_off // 4, transparent,
+                           kind if version == 2 else 0, 0)
+    table = b""
+    if palette is not None:
+        table = struct.pack(">H", len(palette)) + b"".join(bytes([k, *c]) for k, c in enumerate(palette))
+    extra = b""
+    if direct is not None:
+        extra = bytes([5, 6, 5, 0, 0, *direct])
+    return head + table + extra + body
+
+
+def _scanline(raw, row_bytes, _depth):
+    out = bytearray()
+    prev = bytes(row_bytes)
+    for y in range(0, len(raw), row_bytes):
+        row = raw[y:y + row_bytes]
+        for start in range(0, row_bytes, 8):
+            flags, lits = 0, b""
+            for k in range(start, min(start + 8, row_bytes)):
+                if row[k] != prev[k]:
+                    flags |= 0x80 >> (k - start)
+                    lits += bytes([row[k]])
+            out += bytes([flags]) + lits
+        prev = row
+    return bytes(out)
+
+
+def _rle(raw, _row_bytes, _depth):
+    out = bytearray()
+    i = 0
+    while i < len(raw):
+        n = 1
+        while i + n < len(raw) and raw[i + n] == raw[i] and n < 255:
+            n += 1
+        out += bytes([n, raw[i]])
+        i += n
+    return bytes(out)
+
+
+def _packbits(raw, _row_bytes, depth):
+    unit = 2 if depth == 16 else 1
+    units = [raw[i:i + unit] for i in range(0, len(raw), unit)]
+    out = bytearray()
+    i = 0
+    while i < len(units):
+        n = 1
+        while i + n < len(units) and units[i + n] == units[i] and n < 128:
+            n += 1
+        if n > 1:  # a repeat: 257 - count
+            out += bytes([257 - n]) + units[i]
+            i += n
+        else:  # literals up to the next repeat
+            j = i
+            while j < len(units) and j - i < 128 and not (j + 1 < len(units) and units[j + 1] == units[j]):
+                j += 1
+            j = max(j, i + 1)
+            out += bytes([j - i - 1]) + b"".join(units[i:j])
+            i = j
+    return bytes(out)
+
+
+def _pixel_rows(values, width, depth):
+    """Pack rows of pixel values MSB first, rows padded to an even number of bytes."""
+    rows = []
+    row_bytes = ((width * depth + 15) // 16) * 2
+    for row in values:
+        bits = 0
+        for v in row:
+            bits = bits << depth | v
+        bits <<= row_bytes * 8 - width * depth
+        rows.append(bits.to_bytes(row_bytes, "big"))
+    return rows
+
+
+def _rgb(r):
+    return [tuple(r.pixels[k:k + len(r.mode)]) for k in range(0, len(r.pixels), len(r.mode))]
+
+
+def test_palm_bitmap_greys_at_every_depth_and_compression():
+    from bookport.palmbitmap import decode
+    for depth in (1, 2, 4):
+        top = (1 << depth) - 1
+        values = [[(x + y) % (top + 1) for x in range(13)] for y in range(5)]
+        want = [(255 - v * 255 // top,) * 3 for row in values for v in row]
+        for version in (0, 1, 2):
+            for compression in (None, "scanline") if version < 2 else (None, "scanline", "rle", "packbits"):
+                data = _bitmap(13, 5, depth, _pixel_rows(values, 13, depth), version=version, compression=compression)
+                r = decode(data)
+                assert (r.width, r.height, r.mode) == (13, 5, "RGB")
+                assert _rgb(r) == want, (depth, version, compression)
+
+
+def test_palm_bitmap_colour_table_transparency_and_16_bits():
+    from bookport.palmbitmap import decode
+    palette = [(250, 0, 0), (0, 250, 0), (0, 0, 250), (9, 9, 9)]
+    values = [[x % 4 for x in range(7)] for _ in range(3)]
+    data = _bitmap(7, 3, 8, _pixel_rows(values, 7, 8), compression="rle", palette=palette, flags=0x2000, transparent=3)
+    r = decode(data)
+    assert r.mode == "RGBA"
+    assert _rgb(r)[:4] == [(250, 0, 0, 255), (0, 250, 0, 255), (0, 0, 250, 255), (9, 9, 9, 0)]
+    # 16-bit RGB 565: pure red, green, blue and white, packed in 16-bit units
+    px = [0xF800, 0x07E0, 0x001F, 0xFFFF] * 2
+    rows = [b"".join(struct.pack(">H", v) for v in px)] * 4
+    for compression in (None, "packbits", "scanline"):
+        r = decode(_bitmap(8, 4, 16, rows, flags=0x0400, compression=compression, direct=(1, 2, 3)))
+        assert _rgb(r)[:4] == [(255, 0, 0), (0, 255, 0), (0, 0, 255), (255, 255, 255)], compression
+    v3 = decode(_bitmap(8, 4, 16, rows, version=3, compression="packbits"))
+    assert _rgb(v3)[:4] == [(255, 0, 0), (0, 255, 0), (0, 0, 255), (255, 255, 255)]
+
+
+def test_palm_bitmap_chain_uses_the_deepest_and_the_system_palette():
+    from bookport.palmbitmap import SYSTEM_PALETTE, decode
+    low = _bitmap(4, 2, 1, _pixel_rows([[1, 0, 1, 0]] * 2, 4, 1), version=1)
+    low = low[:10] + struct.pack(">H", (len(low) + 16) // 4) + low[12:]  # next: after the empty bitmap that follows
+    dummy = struct.pack(">HHHHBBHI", 0, 0, 0, 0, 255, 1, 0, 0)
+    deep = _bitmap(4, 2, 8, _pixel_rows([[0, 5, 215, 230]] * 2, 4, 8), version=3)
+    r = decode(low + dummy + deep)
+    assert (r.width, r.height) == (4, 2)
+    assert _rgb(r)[:4] == [(255, 255, 255), (255, 0, 255), (0, 0, 0), (0, 128, 128)]
+    assert SYSTEM_PALETTE[1] == (255, 204, 255) and SYSTEM_PALETTE[6] == (255, 255, 204)
+
+
+def test_palm_bitmap_damage_raises_bookport_error():
+    from bookport.palmbitmap import decode
+    good = _bitmap(13, 5, 4, _pixel_rows([[1] * 13] * 5, 13, 4), compression="scanline")
+    v3 = _bitmap(4, 2, 8, _pixel_rows([[1] * 4] * 2, 4, 8), version=3)
+    for bad in (good[:6], good[:4] + b"\0\0" + good[6:], b"\0" * 16, struct.pack(">HHHHBB", 9, 9, 1, 0, 8, 2) + b"\0" * 6,
+                v3[:18]):
+        with pytest.raises(bookport.BookportError):
+            decode(bad)
+    assert decode(good[:-3]).width == 13  # cut short: what is there, the rest blank
+
+
+def _plucker_pages(records):
+    """A Plucker file from raw data records (each with its 8-byte header); home is uid 2."""
+    return pdb_bytes("Plucker test", b"Data", b"Plkr", [struct.pack(">HHHHH", 1, 1, 1, 0, 2), *records])
+
+
+def test_plucker_images(tmp_path):
+    red = [(200, 10, 10)]
+    tile = _bitmap(3, 2, 8, _pixel_rows([[0, 0, 0]] * 2, 3, 8), palette=red)
+    blue = _bitmap(2, 2, 8, _pixel_rows([[0, 0]] * 2, 2, 8), palette=[(10, 10, 200)])
+    text = b"A picture: \x00\x1a\x00\x05 and a big one \x00\x5c\x00\x07\x00\x06 here."
+    recs = [struct.pack(">HHHBB", 2, 1, len(text), 0, 0) + struct.pack(">HH", len(text), 0) + text,
+            struct.pack(">HHHBB", 5, 0, len(tile), 2, 0) + tile,
+            struct.pack(">HHHBB", 6, 0, len(blue), 3, 0) + palmdoc_compress(blue),
+            struct.pack(">HHHBB", 8, 0, len(blue), 2, 0) + blue,
+            struct.pack(">HHHBB", 7, 0, 8, 15, 0) + struct.pack(">HHHH", 2, 1, 5, 8)]  # a 2x1 grid: tile, then blue
+    p = tmp_path / "pics.pdb"
+    p.write_bytes(_plucker_pages(recs))
+    b = bookport.read(p)
+    imgs = [img.get("src") for img in b.tree(b.spine[0]).iter("img")]
+    assert len(imgs) == 2
+    from bookport.images import decode_png
+    first = decode_png(b.resources["images/image00005.png"].data)
+    assert (first.width, first.height) == (3, 2) and _rgb(first)[0][:3] == (200, 10, 10)
+    shown = decode_png(b.resources["images/image00006.png"].data)  # 0x5C shows the second image in the text
+    assert (shown.width, shown.height) == (2, 2) and _rgb(shown)[0][:3] == (10, 10, 200)
+    assert "A picture:" in b.text() and "here." in b.text()
+    # the composite, when a page shows it
+    text2 = b"Grid \x00\x1a\x00\x07"
+    recs[0] = struct.pack(">HHHBB", 2, 1, len(text2), 0, 0) + struct.pack(">HH", len(text2), 0) + text2
+    p.write_bytes(_plucker_pages(recs))
+    b = bookport.read(p)
+    grid = decode_png(b.resources["images/image00007.png"].data)
+    assert (grid.width, grid.height) == (5, 2)
+    px = _rgb(grid)
+    assert px[0][:3] == (200, 10, 10) and px[3][:3] == (10, 10, 200)
+
+
+@pytest.mark.parametrize("fmt, kept", [
+    ("rb", {"publisher": "Pure Tech Press", "isbn": "9780000000002"}),
+    ("snb", {"publisher": "Pure Tech Press", "date": "2021-05-04", "language": "en", "description": "A book for testing every format."}),
+    ("lrf", {"publisher": "Pure Tech Press", "date": "2021-05-04", "language": "en", "subjects": ["Fiction", "Testing"],
+             "description": "A book for testing every format."}),
+])
+def test_rare_writers_keep_the_metadata_their_format_holds(book, tmp_path, fmt, kept):
+    out = tmp_path / f"m.{fmt}"
+    book.write(out)
+    md = bookport.read(out).metadata
+    got = {k: md.identifiers.get("isbn") if k == "isbn" else getattr(md, k) for k in kept}
+    assert got == kept
+
+
+def test_palm_bitmap_16_bit_transparent_colour():
+    # version 2 gives the transparent colour as 8-bit RGB; pixels are 5-6-5, so it's matched in 5-6-5
+    from bookport.palmbitmap import decode
+    key = (0x80 >> 3) << 11 | (0x40 >> 2) << 5 | 0xC0 >> 3
+    rows = [struct.pack(">HH", key, 0xFFFF)] * 2
+    r = decode(_bitmap(2, 2, 16, rows, flags=0x0400 | 0x2000, direct=(0x80, 0x40, 0xC0)))
+    assert r.mode == "RGBA" and [p[3] for p in _rgb(r)] == [0, 255, 0, 255]

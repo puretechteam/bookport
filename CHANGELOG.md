@@ -2,8 +2,22 @@
 
 Newest first. Work in progress collects under Unreleased until the next release.
 
-## Unreleased
+## 2026-11-01: bookport 0.2.0, faster CHM, unpacking CHM and LIT, CBZ writing, kerned PDFs
 
+- **Fixed:** EPUBs made from Python's documentation CHM had 329 epubcheck errors; now 0. Tables with `<col>` straight in the table (as Sphinx writes them) had the columns wrapped in rows and cells, rows were mixed with row groups, and a web link with a bare "%" was left invalid. The columns now go in a `<colgroup>`, loose rows in a `<tbody>`, and the "%" is escaped.
+- **New:** PDF text is kerned: letter pairs such as AV, To and r. are spaced as the font's own kerning table says (checked against fontTools for all 8,836 pairs of printable ASCII characters in each of the four Noto Serif styles). Lines fit a few more words (144,249 lines instead of 144,383 over the 11 corpus books), and typesetting takes 1.3% longer.
+- **Fixed:** in a PDF, a table column exactly as wide as its longest word could break that word between letters ("PAG" and "E") because of a rounding error.
+- **Fixed:** code blocks in CHM help files kept Windows line breaks when converted, so a text file had them mixed with Unix ones (42,369 of them in Python's documentation). Pages are read with one kind of line break now, as XML readers do.
+- **More metadata kept** in the rarer formats: RB keeps the publisher, copyright and ISBN (its info page has keys for them); SNB and LRF keep the date they already wrote, which reading now picks up; LRF keeps every subject, not just the first.
+- **New:** Plucker books keep their pictures: Palm OS bitmaps (1 to 16 bits a pixel, colour tables, transparency, scan-line, RLE and PackBits compression, bitmaps of several depths) become PNG, and composite images are joined into one. Until now they were left out.
+- **New:** writes CBZ comics from books made of pictures (comics read from CBZ, CBR or a folder, fixed-layout picture books): the pages in reading order, a ComicInfo.xml with the metadata and the chapters as page bookmarks, and the same metadata in the ZIP comment for calibre's library. Books with pages of text are refused with a clear message.
+- **New:** `bookport.unpack(path)` gives the files inside a CHM or LIT container, for extracting them. On Python's documentation CHM it gives the same 555 files as 7-Zip, all 46,823,729 bytes identical. DRM-protected LIT is refused, as when converting.
+- Comics read from a CBZ take their chapters from ComicInfo.xml page bookmarks when it has them.
+- **Faster:** CHM and LIT decompression (LZX) is 4.7 times faster: Python's documentation CHM decodes in 3.98 s instead of 18.68 s, and becomes an EPUB in 19.5 s instead of 27.1 s (best of 3 in one process; the side-by-side table in the README times a fresh process per conversion: 18.0 s). The output is byte-identical.
+- **Fixed:** reading a PDF dropped a line at the top or bottom of pages when its words had digits inside them ("A320", "1880s", "word58"): such lines looked like a running header once their numbers were masked. A 144,227-word book read back as 137,927 words; now all 144,227. Only whole numbers are masked now, so page numbers and headers like "Chapter 12" are still dropped.
+- **Fixed:** in a PDF bookport wrote, characters that no font had (drawn as empty boxes) all copied and searched as the first such character, so "∀x ∃y" read back as "←x ←y". They now read back as U+FFFD, the standard sign for an unknown character.
+- The `BOOKPORT_FALLBACK_FONTS` environment variable (TrueType fonts tried first for characters the bundled fonts lack, such as CJK on Linux) is now documented in the README, and tested.
+- **Smaller:** the bundled fonts take 0.86 MB instead of 2.4 MB: they're stored xz-compressed, without two tables bookport doesn't read (GSUB, and the glyph names in post; `tools/slim_fonts.py` makes them from Noto's release). The PDFs bookport writes are byte for byte the same (9 of 9 sample PDFs, every page size and text size); loading all five fonts takes 59 ms instead of 12 ms. The package is 1.7 MB instead of 3.2 MB.
 - **Fixed:** on Python 3.10 and 3.11, a damaged ZIP-based book (EPUB, HTMLZ, DOCX and the rest) whose member claims more bytes than the file holds made reading set aside that much memory first: a 3 KB file asked for 257 MB. Such a member is now refused at once as damaged (under 20 MB peak). Python 3.12 and later already caught it.
 
 ## 2026-10-30: bookport 0.1.0

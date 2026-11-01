@@ -98,51 +98,40 @@ class _Bits:
 class _Tree:
     """A canonical Huffman decoding table from code lengths."""
 
-    __slots__ = ("bits", "lengths", "max_len", "table")
+    __slots__ = ("bits", "flat", "lengths", "long", "max_len")
 
     def __init__(self, lengths: list[int], bits: int):
         self.lengths = lengths
         self.bits = bits
         self.max_len = max(lengths) if lengths else 0
-        self.table = self._build(lengths, bits)
-
-    @staticmethod
-    def _build(lengths, bits):
-        # (symbol, length) for every 'bits'-bit prefix; longer codes go to a dict keyed by (length, code)
+        # every 'bits'-bit prefix as one int, symbol << 5 | length (-1: none); longer codes go to
+        # a dict keyed by (length, code). Codes are given in (length, symbol) order.
         size = 1 << bits
-        table = [None] * size
-        code = 0
+        flat = [-1] * size
         long_codes = {}
-        max_len = max(lengths) if lengths else 0
-        for length in range(1, max_len + 1):
-            for sym, ln in enumerate(lengths):
-                if ln != length:
-                    continue
-                if length <= bits:
-                    start = code << (bits - length)
-                    for k in range(start, start + (1 << (bits - length))):
-                        if k < size:
-                            table[k] = (sym, length)
-                else:
-                    long_codes[(length, code)] = sym
-                code += 1
-            code <<= 1
-        if long_codes:
-            table.append(long_codes)
-        return table
+        code = prev = 0
+        for ln, sym in sorted((ln, sym) for sym, ln in enumerate(lengths) if ln):
+            code <<= ln - prev
+            prev = ln
+            if ln <= bits:
+                first = code << (bits - ln)
+                if first < size:
+                    span = min(1 << (bits - ln), size - first)
+                    flat[first:first + span] = [sym << 5 | ln] * span
+            else:
+                long_codes[(ln, code)] = sym
+            code += 1
+        self.flat = flat
+        self.long = long_codes
 
     def decode(self, bits: _Bits) -> int:
-        t = self.table
         n = self.bits
-        entry = t[bits.peek(n)] if self.max_len else None
-        if entry is not None and not isinstance(entry, dict):
-            sym, ln = entry
-            bits.drop(ln)
-            return sym
-        long_codes = t[-1] if t and isinstance(t[-1], dict) else {}
+        e = self.flat[bits.peek(n)] if self.max_len else -1
+        if e >= 0:
+            bits.drop(e & 31)
+            return e >> 5
         for length in range(n + 1, self.max_len + 1):
-            code = bits.peek(length)
-            sym = long_codes.get((length, code))
+            sym = self.long.get((length, bits.peek(length)))
             if sym is not None:
                 bits.drop(length)
                 return sym
@@ -156,8 +145,7 @@ class LzxDecoder:
         self.window_size = 1 << window_bits
         self.slots = POSITION_SLOTS[window_bits]
         self.main_size = NUM_CHARS + self.slots * 8
-        self.window = bytearray(self.window_size)
-        self.wpos = 0
+        self.history = bytes(self.window_size)  # the window: the last window_size bytes decoded
         self.reset()
 
     def reset(self):
@@ -206,10 +194,10 @@ class LzxDecoder:
         runs out first: past its end the decoder would only read zero bits)."""
         bits = _Bits(data)
         end = len(data) + 4  # the bit buffer reads up to two words ahead
-        out = bytearray()
-        window = self.window
-        wsize = self.window_size
-        mask = wsize - 1
+        padded = data + bytes(32)  # the symbol loop reads words without bounds checks; past the end they are 0
+        # the window followed by this span's output: matches are slices of it
+        hist = bytearray(self.history)
+        base = len(hist)
         if not self.header_read:
             if bits.read(1):
                 hi = bits.read(16)
@@ -218,12 +206,11 @@ class LzxDecoder:
             else:
                 self.e8_size = 0
             self.header_read = True
-        frame_out = 0
         main_tree = length_tree = aligned_tree = None
-        while len(out) < out_len and bits.pos <= end:
-            frame_size = min(FRAME, out_len - len(out))
-            frame = bytearray()
-            while len(frame) < frame_size and bits.pos <= end:
+        while len(hist) - base < out_len and bits.pos <= end:
+            frame_size = min(FRAME, out_len - (len(hist) - base))
+            frame_start = len(hist)
+            while len(hist) - frame_start < frame_size and bits.pos <= end:
                 if self.block_left == 0:
                     if self.block_type == 3 and self._uncompressed_odd:
                         bits.pos += 1  # an odd-sized uncompressed block is padded to 16 bits
@@ -253,71 +240,140 @@ class LzxDecoder:
                         self._uncompressed_odd = bool(self.block_left & 1)
                     else:
                         raise BookportError(f"Damaged LZX data: block type {self.block_type}")
-                take = min(self.block_left, frame_size - len(frame))
+                take = min(self.block_left, frame_size - (len(hist) - frame_start))
                 if self.block_type == 3:
                     raw = bits.raw_bytes(take)
                     if len(raw) < take:
                         bits.pos = end + 1
-                    for b in raw:
-                        window[self.wpos] = b
-                        self.wpos = (self.wpos + 1) & mask
-                    frame += raw
+                    hist += raw
                     self.block_left -= take
                     continue
-                produced = 0
-                while produced < take and bits.pos <= end:
-                    sym = main_tree.decode(bits)
-                    if sym < NUM_CHARS:
-                        window[self.wpos] = sym
-                        self.wpos = (self.wpos + 1) & mask
-                        frame.append(sym)
-                        produced += 1
-                        continue
-                    sym -= NUM_CHARS
-                    length = sym & 7
-                    if length == 7:
-                        length += length_tree.decode(bits)
-                    length += MIN_MATCH
-                    slot = sym >> 3
-                    if slot > 2:
-                        extra = EXTRA_BITS[slot]
-                        if self.block_type == 2 and extra >= 3:
-                            verbatim = bits.read(extra - 3) << 3 if extra > 3 else 0
-                            offset = POSITION_BASE[slot] + verbatim + aligned_tree.decode(bits) - 2
-                        else:
-                            offset = POSITION_BASE[slot] + bits.read(extra) - 2
-                        self.r[2], self.r[1], self.r[0] = self.r[1], self.r[0], offset
-                    elif slot == 0:
-                        offset = self.r[0]
-                    elif slot == 1:
-                        offset = self.r[1]
-                        self.r[1], self.r[0] = self.r[0], offset
-                    else:
-                        offset = self.r[2]
-                        self.r[2], self.r[0] = self.r[0], offset
-                    src = (self.wpos - offset) & mask
-                    for _ in range(length):
-                        b = window[src]
-                        window[self.wpos] = b
-                        frame.append(b)
-                        self.wpos = (self.wpos + 1) & mask
-                        src = (src + 1) & mask
-                    produced += length
+                produced = self._symbols(bits, padded, end, hist, take, main_tree, length_tree,
+                                         aligned_tree if self.block_type == 2 else None)
                 self.block_left -= produced
                 if produced > take:
                     # a match ran past the frame end: carry the surplus over
                     self.block_left = max(0, self.block_left)
-            out += frame[:frame_size]
-            if len(frame) > frame_size:
-                out += frame[frame_size:]
             # each frame ends on a 16-bit boundary in the input
             if self.block_type != 3:
                 bits.align()
             self.frames += 1
-            frame_out += 1
+        self.history = bytes(hist[-self.window_size:])
+        out = hist[base:]
         if self.e8_size:
             out = self._undo_e8(out)
         return bytes(out[:out_len])
+
+    def _symbols(self, bits: _Bits, data: bytes, end: int, hist: bytearray, take: int,
+                 main_tree: _Tree, length_tree: _Tree, aligned_tree: _Tree | None) -> int:
+        """Decode literals and matches into hist until take bytes are made (a match may run past).
+        The bit reader is kept in locals and refilled exactly when _Bits would refill it, so the
+        input is consumed the same way; Huffman codes come from the trees' flat tables."""
+        buf, left, pos = bits.buf, bits.left, bits.pos
+        main_flat, length_flat = main_tree.flat, length_tree.flat
+        aligned_flat = aligned_tree.flat if aligned_tree is not None else None
+        r0, r1, r2 = self.r
+        wsize = self.window_size
+        append = hist.append
+        produced = 0
+        while produced < take and pos <= end:
+            if left < 12:
+                buf |= (data[pos] | data[pos + 1] << 8) << (16 - left)
+                pos += 2
+                left += 16
+            e = main_flat[buf >> 20]
+            if e >= 0:
+                n = e & 31
+                buf = (buf << n) & 0xFFFFFFFF
+                left -= n
+                sym = e >> 5
+            else:  # a code longer than the table, or a bad one
+                bits.buf, bits.left, bits.pos = buf, left, pos
+                sym = main_tree.decode(bits)
+                buf, left, pos = bits.buf, bits.left, bits.pos
+            if sym < NUM_CHARS:
+                append(sym)
+                produced += 1
+                continue
+            sym -= NUM_CHARS
+            length = sym & 7
+            if length == 7:
+                if left < 12:
+                    buf |= (data[pos] | data[pos + 1] << 8) << (16 - left)
+                    pos += 2
+                    left += 16
+                e = length_flat[buf >> 20]
+                if e >= 0:
+                    n = e & 31
+                    buf = (buf << n) & 0xFFFFFFFF
+                    left -= n
+                    length += e >> 5
+                else:
+                    bits.buf, bits.left, bits.pos = buf, left, pos
+                    length += length_tree.decode(bits)
+                    buf, left, pos = bits.buf, bits.left, bits.pos
+            length += MIN_MATCH
+            slot = sym >> 3
+            if slot > 2:
+                extra = EXTRA_BITS[slot]
+                aligned = aligned_flat is not None and extra >= 3
+                n = extra - 3 if aligned else extra  # verbatim bits
+                value = 0
+                if n > 16:  # 17 bits: one, then sixteen
+                    if left < 1:
+                        buf |= (data[pos] | data[pos + 1] << 8) << (16 - left)
+                        pos += 2
+                        left += 16
+                    value = buf >> 31
+                    buf = (buf << 1) & 0xFFFFFFFF
+                    left -= 1
+                    n = 16
+                if n:
+                    if left < n:
+                        buf |= (data[pos] | data[pos + 1] << 8) << (16 - left)
+                        pos += 2
+                        left += 16
+                    value = value << n | buf >> (32 - n)
+                    buf = (buf << n) & 0xFFFFFFFF
+                    left -= n
+                if aligned:
+                    if left < 7:
+                        buf |= (data[pos] | data[pos + 1] << 8) << (16 - left)
+                        pos += 2
+                        left += 16
+                    e = aligned_flat[buf >> 25]
+                    if e >= 0:
+                        n = e & 31
+                        buf = (buf << n) & 0xFFFFFFFF
+                        left -= n
+                        a = e >> 5
+                    else:
+                        bits.buf, bits.left, bits.pos = buf, left, pos
+                        a = aligned_tree.decode(bits)
+                        buf, left, pos = bits.buf, bits.left, bits.pos
+                    offset = POSITION_BASE[slot] + (value << 3) + a - 2
+                else:
+                    offset = POSITION_BASE[slot] + value - 2
+                r2, r1, r0 = r1, r0, offset
+            elif slot == 0:
+                offset = r0
+            elif slot == 1:
+                offset = r1
+                r1, r0 = r0, offset
+            else:
+                offset = r2
+                r2, r0 = r0, offset
+            # the window is a ring of wsize bytes: an offset of 0 or past it wraps around
+            dist = offset if 0 < offset <= wsize else (offset - 1) % wsize + 1
+            src = len(hist) - dist
+            if dist >= length:
+                hist += hist[src:src + length]
+            else:  # the match overlaps what it writes: the last dist bytes repeat
+                hist += (hist[src:] * (length // dist + 1))[:length]
+            produced += length
+        bits.buf, bits.left, bits.pos = buf, left, pos
+        self.r = [r0, r1, r2]
+        return produced
 
     def _undo_e8(self, data: bytearray) -> bytearray:
         size = self.e8_size

@@ -1,9 +1,12 @@
 """DOCX, ODT, RTF and comics."""
 
 import io
+import posixpath
+import re
 import struct
 import zipfile
 import zlib
+from pathlib import Path
 
 import pytest
 
@@ -180,6 +183,65 @@ def test_cbz(tmp_path):
         back = bookport.read(out)
         assert len(back.images()) == 4, fmt
         assert back.fixed_layout, fmt
+
+
+def _pages(book):
+    """The picture of each page, in reading order."""
+    out = []
+    for href in book.spine:
+        img = book.tree(href).find(".//img")
+        out.append(book.resources[posixpath.normpath(posixpath.join(posixpath.dirname(href), img.get("src")))].data)
+    return out
+
+
+def test_cbz_round_trip(tmp_path):
+    src = bookport.read(_cbz(tmp_path))
+    out = tmp_path / "again.cbz"
+    src.write(out)
+    with zipfile.ZipFile(out) as z:
+        assert z.namelist() == ["0001.png", "0002.png", "0003.png", "0004.gif", "ComicInfo.xml"]
+        assert all(i.compress_type == zipfile.ZIP_STORED for i in z.infolist() if i.filename != "ComicInfo.xml")
+    back = bookport.read(out)
+    assert _pages(back) == _pages(src)
+    md = back.metadata
+    assert (md.title, md.authors, md.series, md.series_index, md.language) == ("Big Comic", ["W One", "W Two"], "Bigs", 3, "ja")
+    assert back.direction == "rtl" and back.fixed_layout
+    assert toc_titles(back) == ["ch1", "ch2"]  # the chapters, as ComicInfo page bookmarks
+    assert back.toc[1].href == back.spine[3]
+
+
+def test_cbz_from_an_epub_comic_keeps_every_field(tmp_path):
+    src = bookport.read(_cbz(tmp_path))
+    md = src.metadata
+    md.description, md.publisher, md.subjects, md.date = "A summary.", "Pub & Co", ["Action", "Drama"], "2021-07-04"
+    epub = tmp_path / "c.epub"
+    src.write(epub)
+    out = tmp_path / "c.cbz"
+    bookport.read(epub).write(out)
+    back = bookport.read(out)
+    assert _pages(back) == _pages(src)
+    assert (back.metadata.description, back.metadata.publisher, back.metadata.subjects, back.metadata.date) == (
+        "A summary.", "Pub & Co", ["Action", "Drama"], "2021-07-04")
+    assert toc_titles(back) == ["ch1", "ch2"]
+
+
+def test_cbz_refuses_a_book_of_text(book, tmp_path):
+    with pytest.raises(bookport.BookportError, match="only pictures"):
+        book.write(tmp_path / "text.cbz")
+    assert not list(tmp_path.glob("*.cbz"))
+
+
+@needs_calibre
+def test_calibre_reads_our_cbz(tmp_path):
+    out = tmp_path / "c.cbz"
+    bookport.read(_cbz(tmp_path)).write(out)
+    epub = tmp_path / "calibre.epub"
+    run(EBOOK_CONVERT, out, epub)  # calibre names a converted comic after its file, whatever its metadata says
+    assert len(bookport.read(epub).images()) >= 4
+    meta = run(Path(EBOOK_CONVERT).with_name(Path(EBOOK_CONVERT).name.replace("convert", "meta")), out).stdout.decode()
+    # calibre's library reads a CBZ's metadata from the ComicBookInfo JSON in its ZIP comment
+    assert re.search(r"Title\s*: Big Comic", meta) and re.search(r"Author\(s\)\s*: W One & W Two", meta)
+    assert re.search(r"Series\s*: Bigs #3", meta)
 
 
 def test_cbr_stored(tmp_path):

@@ -170,3 +170,12 @@ def test_picture_with_anchor_is_an_image_block(book):
     root = markup.parse(f'<html><body><p><a id="x"></a><img src="../{href}" alt="A picture"/></p></body></html>')
     blocks = flow.document_blocks(book, "text/p.xhtml", root)
     assert blocks[0].kind == "image" and blocks[0].alt == "A picture" and "text/p.xhtml#x" in blocks[0].anchors
+
+
+def test_the_html_parser_leaves_line_breaks_as_xml_does():
+    # CHM pages are usually written on Windows. The XML parser turns CR LF into LF; the forgiving
+    # HTML parser kept it, so a <pre> block reached a text file with CR LF among LF
+    html = "<html><body><p>Code:</p>\r\n<pre>with open(f) as x:\r\n    pass\r</pre><p>x &lt; 1</p></body></html>"
+    root = markup.HtmlBuilder().build(html)
+    assert root.find(".//pre").text == "with open(f) as x:\n    pass\n"
+    assert "\r" not in markup.serialize(root).decode()
