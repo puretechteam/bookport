@@ -153,7 +153,9 @@ def safe_path(base, link: str, root=None) -> Path | None:
     Refused: absolute paths, drive letters, network (UNC) paths, ``file:`` and other schemes, and
     anything that resolves (symbolic links included) outside ``root``.
     """
-    link = unquote(link.split("#")[0].split("?")[0]).strip()
+    # backslashes are folder separators on every system, as on Windows, where most books are made:
+    # elsewhere "..\x.png" would otherwise be one file name and slip past the check
+    link = unquote(link.split("#")[0].split("?")[0]).strip().replace("\\", "/")
     if not link or "\0" in link or _NOT_LOCAL.match(link):
         return None
     try:

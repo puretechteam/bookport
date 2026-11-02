@@ -144,6 +144,9 @@ def test_safe_path_rule(tmp_path):
     assert limits.safe_path(base, "../x.png") == (tmp_path / "a" / "x.png").resolve()
     assert limits.safe_path(base, "pics/x.png#frag") == (base / "pics" / "x.png").resolve()
     assert limits.safe_path(base, "sub/../../x.png") == (tmp_path / "a" / "x.png").resolve()
+    # backslashes separate folders on Linux and macOS too
+    assert limits.safe_path(base, "pics\\x.png") == (base / "pics" / "x.png").resolve()
+    assert limits.safe_path(base, "..\\x.png") == (tmp_path / "a" / "x.png").resolve()
 
 
 def test_html_reads_only_nearby_files(shelf):

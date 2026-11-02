@@ -2,6 +2,11 @@
 
 Newest first. Work in progress collects under Unreleased until the next release.
 
+## Unreleased
+
+- **Fixed:** on Linux and macOS, a link written with Windows backslashes (`pics\x.png`, `..\..\x.png`) was taken as one odd file name inside the book's folder, so a book made on Windows lost those pictures there (never a file from outside the folder), and a 0.2.0 test failed on Linux. Backslashes now separate folders everywhere, as they always did on Windows.
+- **Tests:** CI runs on Linux as well as Windows (new in 0.2.0); the suite now passes there.
+
 ## 2026-11-01: bookport 0.2.0, faster CHM, unpacking CHM and LIT, CBZ writing, kerned PDFs
 
 - **Fixed:** EPUBs made from Python's documentation CHM had 329 epubcheck errors; now 0. Tables with `<col>` straight in the table (as Sphinx writes them) had the columns wrapped in rows and cells, rows were mixed with row groups, and a web link with a bare "%" was left invalid. The columns now go in a `<colgroup>`, loose rows in a `<tbody>`, and the "%" is escaped.
