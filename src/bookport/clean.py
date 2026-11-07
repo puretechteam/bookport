@@ -740,7 +740,7 @@ def _keep_tail(parent, el):
 
 def _remove(el, parent, keep_children: bool):
     p = parent.get(el)
-    if p is None:
+    if p is None or el not in list(p):  # already moved by what was cleaned before it
         return
     idx = list(p).index(el)
     p.remove(el)

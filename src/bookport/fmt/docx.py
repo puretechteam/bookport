@@ -1,10 +1,11 @@
 """Word documents (DOCX, ECMA-376 / Office Open XML): read and write.
 
 Reading turns paragraphs, runs, styles (headings from style names and outline levels), numbered
-and bulleted lists, tables, images, hyperlinks, bookmarks, footnotes and endnotes into XHTML.
+and bulleted lists, tables, images, hyperlinks, bookmarks, footnotes, endnotes and equations
+(Office Math, as MathML) into XHTML.
 Writing makes a document Word, LibreOffice and Google Docs open, with real heading styles (so
-the navigation pane works), lists, tables, images, internal and external links and the book's
-properties.
+the navigation pane works), lists, tables, images, internal and external links, equations as
+Office Math (editable in Word) and the book's properties.
 """
 
 from __future__ import annotations
@@ -16,7 +17,7 @@ import xml.etree.ElementTree as ET
 import zipfile
 from pathlib import Path
 
-from .. import limits, markup
+from .. import limits, markup, mathml
 from ..book import Book, Metadata, is_external, relative, sniff_image
 from ..errors import BookportError
 
@@ -31,6 +32,8 @@ CP = "http://schemas.openxmlformats.org/package/2006/metadata/core-properties"
 DC = "http://purl.org/dc/elements/1.1/"
 DCTERMS = "http://purl.org/dc/terms/"
 MC = "http://schemas.openxmlformats.org/markup-compatibility/2006"
+OMML = mathml.M
+ET.register_namespace("m", OMML)
 
 
 def w(tag):
@@ -128,6 +131,7 @@ class _Numbering:
     def __init__(self, root):
         self.abstract = {}
         self.nums = {}
+        self.starts: dict[tuple[str, int], str] = {}  # (numId, level) -> a list's own start number
         if root is None:
             return
         for a in root.findall(w("abstractNum")):
@@ -137,15 +141,41 @@ class _Numbering:
             self.abstract[a.get(w("abstractNumId"))] = levels
         for n in root.findall(w("num")):
             self.nums[n.get(w("numId"))] = _wval(n, "abstractNumId")
+            for o in n.findall(w("lvlOverride")):
+                start = _wval(o, "startOverride")
+                if start and o.get(w("ilvl"), "0").isdigit():
+                    self.starts[(n.get(w("numId")), int(o.get(w("ilvl"), "0")))] = start
 
     def kind(self, num_id, level) -> tuple[str, int]:
         levels = self.abstract.get(self.nums.get(num_id), {})
         fmt, start = levels.get(level, ("bullet", "1"))
+        start = self.starts.get((num_id, level), start)
         tag = "ul" if fmt in ("bullet", "none", "") else "ol"
         try:
             return tag, int(start)
         except ValueError:
             return tag, 1
+
+
+WP_NS = "{http://schemas.openxmlformats.org/drawingml/2006/wordprocessingDrawing}"
+
+
+def _shape_position(shape) -> tuple[float, float] | None:
+    """(top, left) of a floating shape in points, from its DrawingML anchor or its VML style."""
+    v = shape.find(f".//{WP_NS}positionV/{WP_NS}posOffset")
+    h = shape.find(f".//{WP_NS}positionH/{WP_NS}posOffset")
+    if v is not None and h is not None:
+        try:
+            return int(v.text or 0) / 12700, int(h.text or 0) / 12700
+        except ValueError:
+            return None
+    for el in shape.iter():
+        style = el.get("style", "") if el.tag.startswith(f"{{{V}}}") else ""
+        top = re.search(r"margin-top:\s*(-?[\d.]+)pt", style)
+        left = re.search(r"margin-left:\s*(-?[\d.]+)pt", style)
+        if top and left:
+            return float(top.group(1)), float(left.group(1))
+    return None
 
 
 def read(path) -> Book:
@@ -268,6 +298,9 @@ class _Converter:
         self.notes_doc = None
         self.size = 0
         self.field = None
+        # text boxes (and floating pictures) waiting for their paragraph to end: (position, order, kind, element)
+        self.boxes: list[tuple[tuple[float, float] | None, int, str, ET.Element]] = []
+        self.box_depth = 0
 
     def new_doc(self):
         root, body = markup.new_document(self.book.metadata.title, self.book.metadata.language)
@@ -325,6 +358,8 @@ class _Converter:
                 container = self.list_item(num_id, ilvl, parent)
                 el = ET.SubElement(container, "li")
                 self.runs(p, el, sid)
+                if self.boxes:
+                    self.flush_boxes(el, el)
                 self.size += len(markup.text_of(el))
                 return
         self.end_lists()
@@ -356,9 +391,62 @@ class _Converter:
         if style:
             el.set("style", "; ".join(style))
         self.runs(p, el, sid)
+        if self.boxes:
+            self.flush_boxes(el, parent)
+            if el.tag == "p" and not len(el) and not (el.text or "").strip() and el in list(parent):
+                parent.remove(el)
+            return
         if el.tag == "p" and not len(el) and not (el.text or "").strip():
             el.text = " "  # keep empty paragraphs as spacing
         self.size += len(markup.text_of(el))
+
+    def take_boxes(self, shape) -> bool:
+        """Keep the text boxes of a drawing (LibreOffice opens each line of a PDF as one) for after
+        the paragraph they're anchored in; True when it had any."""
+        boxes = list(shape.iter(w("txbxContent")))
+        if not boxes:
+            return False
+        inner = {id(b2) for b in boxes for b2 in b.iter(w("txbxContent")) if b2 is not b}
+        pos = _shape_position(shape)
+        for b in boxes:
+            if id(b) not in inner:
+                self.boxes.append((pos, len(self.boxes), "box", b))
+        return True
+
+    def take_floating(self, shape) -> bool:
+        """A floating picture (anchored, not in the line) waits too, so it takes its place among
+        the text boxes; True when the shape is one."""
+        drawing = shape.find(f".//{w('drawing')}") if shape.tag != w("drawing") else shape
+        if drawing is None or drawing.find(f"{WP_NS}anchor") is None:
+            return False
+        self.boxes.append((_shape_position(shape), len(self.boxes), "picture", shape))
+        return True
+
+    def flush_boxes(self, anchor, parent):
+        """The text boxes anchored in a paragraph, in reading order (top to bottom, left to right),
+        as paragraphs after it; an anchor paragraph with nothing else in it goes."""
+        boxes, self.boxes = self.boxes, []
+        if not any(kind == "box" for _, _, kind, _ in boxes):  # floating pictures only: they stay in the paragraph
+            for _, _, _, shape in boxes:
+                self.image(shape, anchor)
+            return
+        if all(pos is not None for pos, _, _, _ in boxes):
+            boxes.sort(key=lambda b: (b[0][0], b[0][1], b[1]))
+        if anchor.tag == "p" and not len(anchor) and not (anchor.text or "").strip() and anchor in list(parent):
+            parent.remove(anchor)
+        self.box_depth += 1
+        try:
+            for _, _, kind, box in boxes:
+                if kind == "picture":
+                    self.image(box, ET.SubElement(parent, "p"))
+                    continue
+                if self.box_depth > 8:  # boxes in boxes in boxes...: their text, flat
+                    ET.SubElement(parent, "p").text = " ".join("".join(t.text or "" for t in box.iter(w("t"))).split())
+                    continue
+                for c in box:
+                    self.block(c, parent)
+        finally:
+            self.box_depth -= 1
 
     def list_item(self, num_id, ilvl, parent):
         tag, start = self.numbering.kind(num_id, ilvl)
@@ -448,6 +536,8 @@ class _Converter:
                         self._inline(alt, target, sid, bold, italic, link)
                     continue
                 self._inline(c, target, sid, bold, italic, link)
+            elif tag in (f"{{{OMML}}}oMath", f"{{{OMML}}}oMathPara"):
+                target.append(mathml.from_omml(c))
             elif tag == w("del") or tag == w("moveFrom"):
                 continue
 
@@ -528,7 +618,8 @@ class _Converter:
                 except ValueError:
                     pass
             elif tag == w("drawing") or tag == w("pict") or tag == w("object"):
-                self.image(c, dest)
+                if not self.take_boxes(c) and not self.take_floating(c):
+                    self.image(c, dest)
             elif tag in (w("footnoteReference"), w("endnoteReference")):
                 kind = "footnote" if tag == w("footnoteReference") else "endnote"
                 nid = c.get(w("id"), "")
@@ -537,12 +628,20 @@ class _Converter:
                 ET.SubElement(a, "sup").text = str(len(self.note_refs) + 1)
                 self.note_refs.append((kind, nid, a))
             elif tag == f"{{{MC}}}AlternateContent":
+                # one of the two copies only: the shape (with its text boxes) or, failing that, the fallback
+                branches = [x for x in (c.find(f"{{{MC}}}Choice"), c.find(f"{{{MC}}}Fallback")) if x is not None]
+                boxed = next((x for x in branches if x.find(f".//{w('txbxContent')}") is not None), None)
+                if boxed is not None:
+                    for k in boxed:
+                        if k.tag in (w("drawing"), w("pict")):
+                            self.take_boxes(k)
+                    continue
                 fb = c.find(f"{{{MC}}}Fallback")
                 if fb is None:
                     fb = c.find(f"{{{MC}}}Choice")
                 if fb is not None:
                     for k in fb:
-                        if k.tag in (w("drawing"), w("pict")):
+                        if k.tag in (w("drawing"), w("pict")) and not self.take_floating(c):
                             self.image(k, dest)
 
     def image(self, el, target):
@@ -668,8 +767,12 @@ def _t(text: str) -> str:
 
 
 class _DocxWriter:
-    def __init__(self, book: Book):
+    def __init__(self, book: Book, notes: dict[str, ET.Element] | None = None):
         self.book = book
+        self.notes = notes or {}  # note key -> its <aside>, taken out of the text
+        self.note_ids: dict[str, int] = {}
+        self.lists: dict[int, tuple[int, str, int, int]] = {}  # list key -> (numId, format, start, level)
+        self.targets: set[str] = set()
         self.rels: list[tuple[str, str, str, bool]] = []  # (id, type, target, external)
         self.media: dict[str, tuple[str, str]] = {}  # href -> (zip name, rel id)
         self.bookmarks: dict[str, str] = {}
@@ -734,22 +837,36 @@ class _DocxWriter:
                 f'<a:xfrm><a:off x="0" y="0"/><a:ext cx="{cx}" cy="{cy}"/></a:xfrm><a:prstGeom prst="rect"><a:avLst/>'
                 f'</a:prstGeom></pic:spPr></pic:pic></a:graphicData></a:graphic></wp:inline></w:drawing></w:r>')
 
-    def runs(self, runs, targets) -> str:
+    def runs(self, runs, targets, code: bool = False) -> str:
         out = []
         for r in runs:
             for a in r.anchors:
                 if a in targets:
                     out.append(self.place(a))
+            if r.note:
+                nid = self.note_id(r.note)
+                if nid:
+                    out.append(f'<w:r><w:rPr><w:rStyle w:val="FootnoteReference"/></w:rPr><w:footnoteReference w:id="{nid}"/>'
+                               "</w:r>")
+                continue
             if r.image:
                 out.append(self.drawing(r.image, r.alt))
+                continue
+            if r.math is not None:
+                om = mathml.to_omml(r.math)
+                if om.tag == f"{{{OMML}}}oMathPara" and sum(1 for x in runs if x.text or x.image) > 1:
+                    om = om[0]  # a display equation among words is set inline
+                out.append(ET.tostring(om, encoding="unicode"))
                 continue
             if not r.text:
                 continue
             props = []
             if r.href:
                 props.append('<w:rStyle w:val="Hyperlink"/>')
-            if r.mono:
-                props.append('<w:rFonts w:ascii="Courier New" w:hAnsi="Courier New" w:cs="Courier New"/>')
+                if r.mono and not code:
+                    props.append('<w:rFonts w:ascii="Courier New" w:hAnsi="Courier New" w:cs="Courier New"/>')
+            elif r.mono and not code:
+                props.append('<w:rStyle w:val="VerbatimChar"/>')
             if r.bold:
                 props.append("<w:b/>")
             if r.italic:
@@ -760,7 +877,7 @@ class _DocxWriter:
                 props.append("<w:strike/>")
             if r.color and re.fullmatch(r"#[0-9a-fA-F]{6}", r.color) and r.color.lower() not in ("#000000",):
                 props.append(f'<w:color w:val="{r.color[1:].upper()}"/>')
-            if r.size and abs(r.size - 1) > 0.1 and not (r.sup or r.sub):
+            if r.size and abs(r.size - 1) > 0.1 and not (r.sup or r.sub) and not code:
                 props.append(f'<w:sz w:val="{max(8, min(144, round(24 * r.size)))}"/>')
             if r.underline:
                 props.append('<w:u w:val="single"/>')
@@ -772,8 +889,9 @@ class _DocxWriter:
             parts = r.text.split("\n")
             body = "<w:br/>".join(_t(p) for p in parts)
             run = f"<w:r>{rpr}{body}</w:r>"
-            if r.href:
-                if is_external(r.href):
+            if r.href and not r.href.lower().startswith("file:"):
+                # a web address, or a relative one that points outside the book
+                if is_external(r.href) or r.href.split("#", 1)[0] not in self.book.resources:
                     rid = self.ext_links.get(r.href)
                     if rid is None:
                         rid = self.rel("http://schemas.openxmlformats.org/officeDocument/2006/relationships/hyperlink",
@@ -785,10 +903,88 @@ class _DocxWriter:
             out.append(run)
         return "".join(out)
 
+    def note_id(self, key: str) -> int:
+        """The footnote number for a note (by its key), 0 when the book has no such note."""
+        if key not in self.notes:
+            return 0
+        if key not in self.note_ids:
+            self.note_ids[key] = len(self.note_ids) + 1
+        return self.note_ids[key]
+
+    def list_num(self, b) -> tuple[int, int]:
+        """(numId, level) for a list item block: one numbering instance per list."""
+        level = max(0, min(8, b.depth - 1))
+        if b.list_key not in self.lists:
+            fmt = _LIST_FORMATS.get(b.list_type, "bullet")
+            self.lists[b.list_key] = (len(self.lists) + 1, fmt, b.list_start, level)
+        return self.lists[b.list_key][0], level
+
+    def paragraph(self, b, targets, bms: str, first: bool, style: str = "") -> str:
+        ppr = []
+        item = bool(b.marker and b.list_key)
+        if b.kind == "h":
+            ppr.append(f'<w:pStyle w:val="Heading{min(max(b.level, 1), 6)}"/>')
+        elif style:
+            ppr.append(f'<w:pStyle w:val="{style}"/>')
+        elif b.kind == "pre":
+            ppr.append('<w:pStyle w:val="SourceCode"/>')
+        elif b.role in ("caption", "figcaption"):
+            ppr.append(f'<w:pStyle w:val="{"TableCaption" if b.role == "caption" else "ImageCaption"}"/>')
+        elif b.role == "dt":
+            ppr.append('<w:pStyle w:val="DefinitionTerm"/>')
+        elif b.role == "dd":
+            ppr.append('<w:pStyle w:val="Definition"/>')
+        elif b.kind == "image" and b.role == "figure":
+            ppr.append('<w:pStyle w:val="CaptionedFigure"/>')
+        elif b.quote:
+            ppr.append('<w:pStyle w:val="Quote"/>')
+        elif item and b.kind == "li":
+            ppr.append('<w:pStyle w:val="Compact"/>')  # an item that is one line of text, not paragraphs: a tight list
+        if b.page_break and not first:
+            ppr.append("<w:pageBreakBefore/>")
+        if item:
+            num, level = self.list_num(b)
+            ppr.append(f'<w:numPr><w:ilvl w:val="{level}"/><w:numId w:val="{num}"/></w:numPr>')
+        align = {"center": "center", "right": "right", "justify": "both"}.get(b.align)
+        if b.kind == "image":
+            align = "center"
+        if align:
+            ppr.append(f'<w:jc w:val="{align}"/>')
+        left = b.margin_left * 240 if b.margin_left else 0
+        if b.list_key and not item:
+            left = 720 * max(1, b.depth)  # a later paragraph of a list item lines up with its text
+        elif b.marker and not b.list_key:
+            left = 360 * b.depth + 360
+        elif item or b.role or style:
+            left = 0  # the numbering or the style sets the indent
+        indent = ""
+        if left > 0:
+            indent += f' w:left="{int(left)}"'
+        if b.marker and not item:
+            indent += ' w:hanging="360"'
+        elif b.indent > 0 and b.kind == "p" and not b.list_key:
+            indent += f' w:firstLine="{int(b.indent * 240)}"'
+        if indent:
+            ppr.append(f"<w:ind{indent}/>")
+        if b.kind == "p" and b.margin_top == 0 and b.indent > 0:
+            ppr.append('<w:spacing w:before="0" w:after="0"/>')
+        ppr_xml = f"<w:pPr>{''.join(ppr)}</w:pPr>" if ppr else ""
+        if b.kind == "image":
+            content = self.drawing(b.image, b.alt)
+        else:
+            marker = "" if item or not b.marker else \
+                f"<w:r><w:t xml:space=\"preserve\">{markup._esc_text(b.marker)}\t</w:t></w:r>"
+            runs = b.runs
+            if b.kind == "h":  # the heading style is bold already: bold runs would read as strong text
+                from dataclasses import replace
+                runs = [replace(r, bold=False) for r in runs]
+            content = marker + self.runs(runs, targets, code=b.kind == "pre")
+        return f"<w:p>{ppr_xml}{bms}{content}</w:p>"
+
     def document(self) -> str:
         from ..flow import book_blocks
         blocks = book_blocks(self.book)
-        targets = {r.href for b in blocks for r in b.runs if r.href and not is_external(r.href)}
+        self.targets = targets = {r.href for b in blocks for r in b.runs if r.href and not is_external(r.href)}
         targets |= {r.href for b in blocks if b.kind == "table" for row in b.rows for c in row for r in c.runs
                     if r.href and not is_external(r.href)}
         body = []
@@ -803,15 +999,6 @@ class _DocxWriter:
             for a in b.anchors:
                 if a in targets:
                     bms += self.place(a)
-            ppr = []
-            if b.kind == "h":
-                ppr.append(f'<w:pStyle w:val="Heading{min(max(b.level, 1), 6)}"/>')
-            elif b.kind == "pre":
-                ppr.append('<w:pStyle w:val="Code"/>')
-            elif b.quote:
-                ppr.append('<w:pStyle w:val="Quote"/>')
-            if b.page_break and body:
-                ppr.append("<w:pageBreakBefore/>")
             if b.kind == "table":
                 body.append(self.table(b, targets, bms))
                 continue
@@ -819,40 +1006,71 @@ class _DocxWriter:
                 body.append('<w:p><w:pPr><w:pBdr><w:bottom w:val="single" w:sz="6" w:space="1" w:color="auto"/></w:pBdr>'
                             "</w:pPr></w:p>")
                 continue
-            align = {"center": "center", "right": "right", "justify": "both"}.get(b.align)
-            if b.kind == "image":
-                align = "center"
-            if align:
-                ppr.append(f'<w:jc w:val="{align}"/>')
-            left = b.margin_left * 240 if b.margin_left else 0
-            if b.marker:
-                left = 360 * b.depth + 360
-            indent = ""
-            if left > 0:
-                indent += f' w:left="{int(left)}"'
-            if b.marker:
-                indent += ' w:hanging="360"'
-            elif b.indent > 0 and b.kind == "p":
-                indent += f' w:firstLine="{int(b.indent * 240)}"'
-            if indent:
-                ppr.append(f"<w:ind{indent}/>")
-            if b.kind == "p" and b.margin_top == 0 and b.indent > 0:
-                ppr.append('<w:spacing w:before="0" w:after="0"/>')
-            ppr_xml = f"<w:pPr>{''.join(ppr)}</w:pPr>" if ppr else ""
-            if b.kind == "image":
-                content = self.drawing(b.image, b.alt)
-            else:
-                runs = b.runs
-                if b.kind == "pre":
-                    from dataclasses import replace
-                    runs = [replace(r, mono=False) for r in runs]
-                marker = f"<w:r><w:t xml:space=\"preserve\">{markup._esc_text(b.marker)}\t</w:t></w:r>" if b.marker else ""
-                content = marker + self.runs(runs, targets)
-            body.append(f"<w:p>{ppr_xml}{bms}{content}</w:p>")
+            body.append(self.paragraph(b, targets, bms, first=not body))
         body.append('<w:sectPr><w:pgSz w:w="12240" w:h="15840"/><w:pgMar w:top="1440" w:right="1440" w:bottom="1440" '
                     'w:left="1440" w:header="720" w:footer="720" w:gutter="0"/></w:sectPr>')
-        return (f'<?xml version="1.0" encoding="UTF-8" standalone="yes"?>\n<w:document xmlns:w="{W}" xmlns:r="{R}" '
-                f'xmlns:wp="{WP}" xmlns:a="{A}" xmlns:pic="{PIC}"><w:body>' + "".join(body) + "</w:body></w:document>")
+        return (f'<?xml version="1.0" encoding="UTF-8" standalone="yes"?>\n<w:document {_ROOT_NS}><w:body>'
+                + "".join(body) + "</w:body></w:document>")
+
+    def footnotes(self) -> str:
+        """footnotes.xml: the separators Word expects, then every note that is called, in call order."""
+        from ..flow import document_blocks
+        out = [('<w:footnote w:type="separator" w:id="-1"><w:p><w:pPr><w:spacing w:after="0" w:line="240" '
+                'w:lineRule="auto"/></w:pPr><w:r><w:separator/></w:r></w:p></w:footnote>'
+                '<w:footnote w:type="continuationSeparator" w:id="0"><w:p><w:pPr><w:spacing w:after="0" w:line="240" '
+                'w:lineRule="auto"/></w:pPr><w:r><w:continuationSeparator/></w:r></w:p></w:footnote>')]
+        done = 0
+        keys = list(self.note_ids)
+        while done < len(keys):  # a note may call another
+            key = keys[done]
+            done += 1
+            href = key.split("#", 1)[0]
+            root, body = markup.new_document()
+            aside = self.notes[key]
+            body.text = aside.text
+            for c in list(aside):
+                body.append(c)
+            paras = []
+            for b in document_blocks(self.book, href, root):
+                if b.kind == "table":
+                    paras.append(self.table(b, self.targets, ""))
+                    continue
+                if b.kind == "hr":
+                    continue
+                p = self.paragraph(b, self.targets, "", first=True, style="" if b.kind in ("pre", "li") else "FootnoteText")
+                paras.append(p)
+            ref = '<w:r><w:rPr><w:rStyle w:val="FootnoteReference"/></w:rPr><w:footnoteRef/></w:r>' \
+                  '<w:r><w:t xml:space="preserve"> </w:t></w:r>'
+            if paras and paras[0].startswith("<w:p>"):
+                head = re.match(r"<w:p>(<w:pPr>.*?</w:pPr>)?", paras[0])
+                paras[0] = paras[0][:head.end()] + ref + paras[0][head.end():]
+            else:
+                paras.insert(0, f'<w:p><w:pPr><w:pStyle w:val="FootnoteText"/></w:pPr>{ref}</w:p>')
+            out.append(f'<w:footnote w:id="{self.note_ids[key]}">{"".join(paras)}</w:footnote>')
+            keys = list(self.note_ids)
+        return (f'<?xml version="1.0" encoding="UTF-8" standalone="yes"?>\n<w:footnotes {_ROOT_NS}>'
+                + "".join(out) + "</w:footnotes>")
+
+    def numbering(self) -> str:
+        abstracts: dict[str, int] = {}
+        for _num, fmt, _start, _level in self.lists.values():
+            abstracts.setdefault(fmt, len(abstracts))
+        out = []
+        for fmt, aid in abstracts.items():
+            levels = []
+            for i in range(9):
+                text = "•◦▪"[i % 3] if fmt == "bullet" else f"%{i + 1}."
+                levels.append(f'<w:lvl w:ilvl="{i}"><w:start w:val="1"/><w:numFmt w:val="{fmt}"/><w:lvlText w:val="{text}"/>'
+                              f'<w:lvlJc w:val="left"/><w:pPr><w:ind w:left="{720 * (i + 1)}" w:hanging="360"/></w:pPr>'
+                              "</w:lvl>")
+            out.append(f'<w:abstractNum w:abstractNumId="{aid}"><w:multiLevelType w:val="hybridMultilevel"/>'
+                       + "".join(levels) + "</w:abstractNum>")
+        for num, fmt, start, level in self.lists.values():
+            override = "" if fmt == "bullet" else \
+                f'<w:lvlOverride w:ilvl="{level}"><w:startOverride w:val="{start}"/></w:lvlOverride>'
+            out.append(f'<w:num w:numId="{num}"><w:abstractNumId w:val="{abstracts[fmt]}"/>{override}</w:num>')
+        return (f'<?xml version="1.0" encoding="UTF-8" standalone="yes"?>\n<w:numbering xmlns:w="{W}">'
+                + "".join(out) + "</w:numbering>")
 
     def table(self, b, targets, bms) -> str:
         cols = max(sum(c.colspan for c in row) for row in b.rows)
@@ -860,24 +1078,135 @@ class _DocxWriter:
         out = ['<w:tbl><w:tblPr><w:tblStyle w:val="TableGrid"/><w:tblW w:w="0" w:type="auto"/><w:tblBorders>'
                + "".join(f'<w:{s} w:val="single" w:sz="4" w:space="0" w:color="auto"/>'
                          for s in ("top", "left", "bottom", "right", "insideH", "insideV"))
-               + "</w:tblBorders></w:tblPr><w:tblGrid>" + f'<w:gridCol w:w="{width}"/>' * cols + "</w:tblGrid>"]
+               + '</w:tblBorders><w:tblLook w:val="0020" w:firstRow="1" w:lastRow="0" w:firstColumn="0" w:lastColumn="0" '
+               'w:noHBand="0" w:noVBand="0"/></w:tblPr><w:tblGrid>' + f'<w:gridCol w:w="{width}"/>' * cols + "</w:tblGrid>"]
+        header_rows = 0
+        for row in b.rows:
+            if row and all(c.header for c in row):
+                header_rows += 1
+            else:
+                break
+        merged: dict[int, tuple[int, int]] = {}  # column -> (rows still covered, columns spanned) by a rowspan above
         for k, row in enumerate(b.rows):
-            out.append("<w:tr>")
-            used = 0
-            for cell in row:
-                span = f'<w:gridSpan w:val="{cell.colspan}"/>' if cell.colspan > 1 else ""
-                used += cell.colspan
+            out.append("<w:tr><w:trPr><w:tblHeader/></w:trPr>" if k < header_rows else "<w:tr>")
+            col = 0
+            cells = iter(row)
+            first = True
+            while col < cols:
+                if col in merged:
+                    left, span = merged[col]
+                    gs = f'<w:gridSpan w:val="{span}"/>' if span > 1 else ""
+                    out.append(f'<w:tc><w:tcPr><w:tcW w:w="{width * span}" w:type="dxa"/>{gs}<w:vMerge/></w:tcPr><w:p/></w:tc>')
+                    if left <= 1:
+                        del merged[col]
+                    else:
+                        merged[col] = (left - 1, span)
+                    col += span
+                    continue
+                cell = next(cells, None)
+                if cell is None:
+                    out.append(f'<w:tc><w:tcPr><w:tcW w:w="{width}" w:type="dxa"/></w:tcPr><w:p/></w:tc>')
+                    col += 1
+                    continue
+                span = max(1, min(cell.colspan, cols - col))
+                gs = f'<w:gridSpan w:val="{span}"/>' if span > 1 else ""
+                vm = ""
+                if cell.rowspan > 1 and k + 1 < len(b.rows):
+                    vm = '<w:vMerge w:val="restart"/>'
+                    merged[col] = (min(cell.rowspan, len(b.rows) - k) - 1, span)
                 runs = self.runs(cell.runs, targets)
                 if cell.header:
                     runs = runs.replace("<w:r><w:t", "<w:r><w:rPr><w:b/></w:rPr><w:t")
-                prefix = bms if k == 0 and not used - cell.colspan else ""
-                out.append(f'<w:tc><w:tcPr><w:tcW w:w="{width * cell.colspan}" w:type="dxa"/>{span}</w:tcPr>'
+                prefix = bms if k == 0 and first else ""
+                first = False
+                out.append(f'<w:tc><w:tcPr><w:tcW w:w="{width * span}" w:type="dxa"/>{gs}{vm}</w:tcPr>'
                            f"<w:p>{prefix}{runs}</w:p></w:tc>")
-            for _ in range(cols - used):
-                out.append(f'<w:tc><w:tcPr><w:tcW w:w="{width}" w:type="dxa"/></w:tcPr><w:p/></w:tc>')
+                col += span
             out.append("</w:tr>")
         out.append("</w:tbl><w:p/>")
         return "".join(out)
+
+
+_LIST_FORMATS = {"disc": "bullet", "circle": "bullet", "square": "bullet", "none": "bullet", "decimal": "decimal",
+                 "decimal-leading-zero": "decimalZero", "lower-alpha": "lowerLetter", "lower-latin": "lowerLetter",
+                 "upper-alpha": "upperLetter", "upper-latin": "upperLetter", "lower-roman": "lowerRoman",
+                 "upper-roman": "upperRoman"}
+_ROOT_NS = f'xmlns:w="{W}" xmlns:r="{R}" xmlns:wp="{WP}" xmlns:a="{A}" xmlns:pic="{PIC}" xmlns:m="{OMML}"'
+_NOTE_BACKLINK = re.compile(r"^\s*(?:\[?\d+\]?[.)]?|↩︎?)\s*$")
+
+
+def _keep_web_links(book: Book, before: bool) -> None:
+    """Links to relative web addresses outside the book ("/about/") are dropped by the clean-up
+    for EPUB; a Word document keeps them: park them before it and put them back after."""
+    from ..book import resolve
+    for href, _ in book.documents():
+        root = book.tree(href)
+        changed = False
+        for a in root.iter("a"):
+            if before:
+                link = a.get("href", "")
+                doc = link.split("#", 1)[0]
+                if doc and not is_external(link) and not link.lower().startswith(("file:", "javascript:"))                         and resolve(href, doc) not in book.resources:
+                    a.set("data-web-href", link)
+                    changed = True
+            elif a.get("data-web-href") is not None:
+                a.set("href", a.attrib.pop("data-web-href"))
+                changed = True
+        if changed:
+            book.set_tree(href, root)
+
+
+def _take_notes(book: Book) -> dict[str, ET.Element]:
+    """Move every footnote the book calls out of the text: {key: its <aside>}. The calls get a
+    data-note attribute (the flow turns them into note runs); a "Notes" page left empty goes."""
+    from ..book import resolve
+    from ..textwriter import is_note, is_noteref
+    asides: dict[str, tuple[str, ET.Element]] = {}
+    for href, _ in book.documents():
+        for el in book.tree(href).iter():
+            if is_note(el) and el.get("id"):
+                asides[f"{href}#{el.get('id')}"] = (href, el)
+    used: dict[str, ET.Element] = {}
+    for href, _ in book.documents():
+        for a in book.tree(href).iter("a"):
+            if not is_noteref(a):
+                continue
+            link = a.get("href", "")
+            doc, _, frag = link.partition("#")
+            key = f"{resolve(href, doc) if doc else href}#{frag}"
+            if key in asides:
+                a.set("data-note", key)
+                used[key] = asides[key][1]
+    touched = set()
+    for key, aside in used.items():
+        href = asides[key][0]
+        root = book.tree(href)
+        parent = next((p for p in root.iter() if aside in list(p)), None)
+        if parent is not None:
+            parent.remove(aside)
+            touched.add(href)
+        # the number or arrow some readers put at the start of a note, linking back to the call
+        for a in list(aside.iter("a")):
+            if _NOTE_BACKLINK.match(markup.text_of(a)) and a.get("href"):
+                holder = next((p for p in aside.iter() if a in list(p)), None)
+                if holder is not None:
+                    tail = a.tail
+                    idx = list(holder).index(a)
+                    holder.remove(a)
+                    if tail:
+                        if idx == 0:
+                            holder.text = (holder.text or "") + tail
+                        else:
+                            holder[idx - 1].tail = (holder[idx - 1].tail or "") + tail
+    for href in touched:
+        root = book.tree(href)
+        body = root.find("body")
+        if body is not None and not "".join(markup.text_of(c) for c in body if c.tag not in ("h1", "h2", "h3")).strip() \
+                and not body.findall(".//img"):
+            book.spine = [s for s in book.spine if s != href]
+        else:
+            book.set_tree(href, root)
+    return used
 
 
 STYLES = f"""<?xml version="1.0" encoding="UTF-8" standalone="yes"?>
@@ -891,9 +1220,27 @@ STYLES = f"""<?xml version="1.0" encoding="UTF-8" standalone="yes"?>
 %HEADINGS%
 <w:style w:type="paragraph" w:styleId="Quote"><w:name w:val="Quote"/><w:basedOn w:val="Normal"/><w:qFormat/>
 <w:pPr><w:ind w:left="720" w:right="720"/></w:pPr><w:rPr><w:i/></w:rPr></w:style>
-<w:style w:type="paragraph" w:styleId="Code"><w:name w:val="Code"/><w:basedOn w:val="Normal"/><w:qFormat/>
+<w:style w:type="paragraph" w:styleId="SourceCode"><w:name w:val="Source Code"/><w:basedOn w:val="Normal"/><w:qFormat/>
 <w:pPr><w:spacing w:after="0" w:line="240" w:lineRule="auto"/></w:pPr>
 <w:rPr><w:rFonts w:ascii="Courier New" w:hAnsi="Courier New" w:cs="Courier New"/><w:sz w:val="20"/></w:rPr></w:style>
+<w:style w:type="character" w:styleId="VerbatimChar"><w:name w:val="Verbatim Char"/><w:basedOn w:val="DefaultParagraphFont"/>
+<w:rPr><w:rFonts w:ascii="Courier New" w:hAnsi="Courier New" w:cs="Courier New"/><w:sz w:val="22"/></w:rPr></w:style>
+<w:style w:type="paragraph" w:styleId="FootnoteText"><w:name w:val="Footnote Text"/><w:basedOn w:val="Normal"/><w:qFormat/>
+<w:pPr><w:spacing w:after="60"/></w:pPr><w:rPr><w:sz w:val="20"/></w:rPr></w:style>
+<w:style w:type="character" w:styleId="FootnoteReference"><w:name w:val="Footnote Reference"/>
+<w:basedOn w:val="DefaultParagraphFont"/><w:rPr><w:vertAlign w:val="superscript"/></w:rPr></w:style>
+<w:style w:type="paragraph" w:styleId="TableCaption"><w:name w:val="Table Caption"/><w:basedOn w:val="Normal"/>
+<w:pPr><w:keepNext/><w:spacing w:before="120"/></w:pPr><w:rPr><w:i/></w:rPr></w:style>
+<w:style w:type="paragraph" w:styleId="CaptionedFigure"><w:name w:val="Captioned Figure"/><w:basedOn w:val="Normal"/>
+<w:pPr><w:keepNext/><w:jc w:val="center"/></w:pPr></w:style>
+<w:style w:type="paragraph" w:styleId="ImageCaption"><w:name w:val="Image Caption"/><w:basedOn w:val="Normal"/>
+<w:pPr><w:jc w:val="center"/></w:pPr><w:rPr><w:i/></w:rPr></w:style>
+<w:style w:type="paragraph" w:styleId="Compact"><w:name w:val="Compact"/><w:basedOn w:val="Normal"/>
+<w:pPr><w:spacing w:before="36" w:after="36"/></w:pPr></w:style>
+<w:style w:type="paragraph" w:styleId="DefinitionTerm"><w:name w:val="Definition Term"/><w:basedOn w:val="Normal"/>
+<w:next w:val="Definition"/><w:pPr><w:keepNext/><w:spacing w:after="0"/></w:pPr><w:rPr><w:b/></w:rPr></w:style>
+<w:style w:type="paragraph" w:styleId="Definition"><w:name w:val="Definition"/><w:basedOn w:val="Normal"/>
+<w:pPr><w:ind w:left="720"/></w:pPr></w:style>
 <w:style w:type="character" w:default="1" w:styleId="DefaultParagraphFont"><w:name w:val="Default Paragraph Font"/></w:style>
 <w:style w:type="character" w:styleId="Hyperlink"><w:name w:val="Hyperlink"/><w:basedOn w:val="DefaultParagraphFont"/>
 <w:rPr><w:color w:val="0563C1"/><w:u w:val="single"/></w:rPr></w:style>
@@ -919,14 +1266,27 @@ def _headings():
 def write(book: Book, path, **_) -> None:
     from .. import clean
     b = book.copy()
+    _keep_web_links(b, True)
     clean.clean_book(b)
-    wr = _DocxWriter(b)
+    _keep_web_links(b, False)
+    wr = _DocxWriter(b, _take_notes(b))
     document = wr.document()
+    footnotes = wr.footnotes() if wr.note_ids else ""
+    numbering = wr.numbering() if wr.lists else ""
     md = b.metadata
     lang = md.language or "en"
     styles = STYLES.replace("%HEADINGS%", _headings()).replace("%LANG%", _esc(lang))
     rels = [("rId1", "http://schemas.openxmlformats.org/officeDocument/2006/relationships/styles", "styles.xml", False),
             ("rId2", "http://schemas.openxmlformats.org/officeDocument/2006/relationships/settings", "settings.xml", False)]
+    if numbering:
+        rels.append(("rId3", "http://schemas.openxmlformats.org/officeDocument/2006/relationships/numbering", "numbering.xml",
+                     False))
+    if footnotes:
+        rels.append(("rId4", "http://schemas.openxmlformats.org/officeDocument/2006/relationships/footnotes", "footnotes.xml",
+                     False))
+    note_rel_xml = "".join(
+        f'<Relationship Id="{rid}" Type="{kind}" Target="{_esc(target)}"' + (' TargetMode="External"' if ext else "") + "/>"
+        for rid, kind, target, ext in wr.rels)
     rels += wr.rels
     rel_xml = "".join(
         f'<Relationship Id="{rid}" Type="{kind}" Target="{_esc(target)}"' + (' TargetMode="External"' if ext else "") + "/>"
@@ -946,7 +1306,9 @@ def write(book: Book, path, **_) -> None:
     app = ('<?xml version="1.0" encoding="UTF-8" standalone="yes"?>\n<Properties xmlns="http://schemas.openxmlformats.org/'
            'officeDocument/2006/extended-properties"><Application>bookport</Application></Properties>')
     settings = (f'<?xml version="1.0" encoding="UTF-8" standalone="yes"?>\n<w:settings xmlns:w="{W}">'
-                '<w:defaultTabStop w:val="720"/><w:compat/></w:settings>')
+                '<w:defaultTabStop w:val="720"/>'
+                + ('<w:footnotePr><w:footnote w:id="-1"/><w:footnote w:id="0"/></w:footnotePr>' if footnotes else "")
+                + "<w:compat/></w:settings>")
     ctypes = ('<?xml version="1.0" encoding="UTF-8" standalone="yes"?>\n<Types xmlns="http://schemas.openxmlformats.org/'
               'package/2006/content-types"><Default Extension="rels" ContentType="application/vnd.openxmlformats-package.'
               'relationships+xml"/><Default Extension="xml" ContentType="application/xml"/>'
@@ -958,7 +1320,12 @@ def write(book: Book, path, **_) -> None:
               'ContentType="application/vnd.openxmlformats-officedocument.wordprocessingml.settings+xml"/>'
               '<Override PartName="/docProps/core.xml" ContentType="application/vnd.openxmlformats-package.core-properties'
               '+xml"/><Override PartName="/docProps/app.xml" ContentType="application/vnd.openxmlformats-officedocument.'
-              'extended-properties+xml"/></Types>')
+              'extended-properties+xml"/>'
+              + ('<Override PartName="/word/numbering.xml" ContentType="application/vnd.openxmlformats-officedocument.'
+                 'wordprocessingml.numbering+xml"/>' if numbering else "")
+              + ('<Override PartName="/word/footnotes.xml" ContentType="application/vnd.openxmlformats-officedocument.'
+                 'wordprocessingml.footnotes+xml"/>' if footnotes else "")
+              + "</Types>")
     root_rels = ('<?xml version="1.0" encoding="UTF-8" standalone="yes"?>\n<Relationships xmlns="' + REL + '">'
                  '<Relationship Id="rId1" Type="http://schemas.openxmlformats.org/officeDocument/2006/relationships/'
                  'officeDocument" Target="word/document.xml"/><Relationship Id="rId2" Type="http://schemas.openxmlformats.'
@@ -976,6 +1343,13 @@ def write(book: Book, path, **_) -> None:
         z.writestr("word/settings.xml", settings)
         z.writestr("word/_rels/document.xml.rels",
                    f'<?xml version="1.0" encoding="UTF-8" standalone="yes"?>\n<Relationships xmlns="{REL}">{rel_xml}</Relationships>')
+        if numbering:
+            z.writestr("word/numbering.xml", numbering)
+        if footnotes:
+            z.writestr("word/footnotes.xml", footnotes)
+            z.writestr("word/_rels/footnotes.xml.rels",
+                       f'<?xml version="1.0" encoding="UTF-8" standalone="yes"?>\n<Relationships xmlns="{REL}">{note_rel_xml}'
+                       "</Relationships>")
         for name, _rid, data in wr.media.values():
             z.writestr(f"word/{name}", data)
     Path(path).write_bytes(buf.getvalue())

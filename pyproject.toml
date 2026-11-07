@@ -5,7 +5,7 @@ build-backend = "setuptools.build_meta"
 [project]
 name = "bookport"
 dynamic = ["version"]
-description = "Read and write ebooks in every format (EPUB, MOBI, AZW3, PDF, FB2, LIT, LRF, ...) in pure Python. No Calibre, no dependencies."
+description = "Read and write ebooks in every format (EPUB, MOBI, AZW3, PDF, FB2, LIT, LRF, ...) and nine markup languages, and read DjVu, in pure Python. No Calibre, no Pandoc, no dependencies."
 readme = "README.md"
 license = "MIT"
 license-files = ["LICENSE"]

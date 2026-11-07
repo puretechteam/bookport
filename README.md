@@ -1,10 +1,13 @@
 # bookport
 
-Read and write ebooks in every common and rare format, in pure Python. No Calibre, no dependencies.
+Read and write ebooks in every common and rare format, documents in nine markup languages, and DjVu books, in pure Python. No Calibre, no Pandoc, no DjVuLibre, no dependencies.
 
 ```
 pip install git+https://github.com/puretechteam/bookport
+pip install https://github.com/puretechteam/bookport/releases/download/v0.3.0/bookport_native-0.3.0-cp310-abi3-win_amd64.whl
 ```
+
+The second line is optional: bookport-native, the compiled DjVu decoders for 64-bit Windows (each [release](https://github.com/puretechteam/bookport/releases) has Linux and macOS wheels too). Without it bookport reads DjVu the same way, in Python, more slowly.
 
 ```python
 import bookport
@@ -14,6 +17,8 @@ book.write("novel.epub")                             # format from the extension
 book.write("novel.pdf", page_size="ereader", text_size="large")
 bookport.convert("story.fb2", "story.azw3")
 bookport.formats()                                   # {"epub": {"name": "EPUB", "read": True, "write": True}, ...}
+bookport.convert("paper.tex", "paper.docx")         # LaTeX with its equations and citations
+bookport.djvu.to_pdf("scan.djvu", "scan.pdf")        # a searchable PDF
 ```
 
 or from a terminal:
@@ -30,9 +35,9 @@ bookport --formats
 
 ## Why bookport?
 
-Converting ebooks has meant installing Calibre: about 670 MB, GPL, and a program to drive from the outside. bookport is a 1.7 MB library (half of it the embedded fonts) with nothing else to install, MIT licensed, that runs anywhere Python 3.10+ does and bundles cleanly into an app.
+Converting ebooks has meant installing Calibre: about 670 MB, GPL, and a program to drive from the outside. bookport is a 2.8 MB library (a third of it the embedded fonts) with nothing else to install, MIT licensed, that runs anywhere Python 3.10+ does and bundles cleanly into an app.
 
-It was written for [ConvertAll](https://github.com/puretechteam/ConvertAll), a drag-and-drop file converter, to replace Calibre there. It's a sibling of [meshport](https://github.com/puretechteam/meshport) (3D) and [packport](https://github.com/puretechteam/packport) (archives).
+It was written for [ConvertAll](https://github.com/puretechteam/ConvertAll), a drag-and-drop file converter, to replace Calibre there, and since 0.3.0 Pandoc (225 MB, for markup languages) and DjVuLibre (for DjVu books) as well: faster than each of them on every document measured but three LaTeX files where Pandoc finds almost nothing, DjVu PDFs with bookport-native (see the [CHANGELOG](CHANGELOG.md)). It's a sibling of [meshport](https://github.com/puretechteam/meshport) (3D), [packport](https://github.com/puretechteam/packport) (archives) and [pixport](https://github.com/puretechteam/pixport) (camera RAW and other pictures).
 
 ## bookport and Calibre, side by side
 
@@ -40,7 +45,7 @@ Both tools converted the same books on the same Windows 11 machine, one conversi
 
 | | Calibre | bookport |
 |---|---|---|
-| Install size | 666.5 MB | **1.7 MB** |
+| Install size | 666.5 MB | **2.8 MB** |
 | Python documentation CHM to EPUB | 196.8 s, 7,781 epubcheck errors | **18.0 s**, 0 epubcheck errors (same 4,171 TOC entries, 100% of Calibre's words) |
 
 **From EPUB** (13 books from Project Gutenberg and Standard Ebooks, among them a Chinese novel, poetry, and books with tables, footnotes and pictures):
@@ -97,7 +102,7 @@ To run the comparison yourself: `python benchmarks/fetch_corpus.py <folder> --to
 | PDF | ✓ | ✓ |
 | Word (DOCX) | ✓ | ✓ |
 | RTF | ✓ | ✓ |
-| OpenDocument text (ODT) | ✓ | |
+| OpenDocument text (ODT) | ✓ | ✓ |
 | HTML, HTMLZ | ✓ | ✓ |
 | Plain text, TXTZ, Markdown | ✓ | ✓ |
 | Palm eReader, PalmDOC, zTXT (`.pdb`) | ✓ | ✓ |
@@ -110,6 +115,9 @@ To run the comparison yourself: `python benchmarks/fetch_corpus.py <folder> --to
 | Psion TCR | ✓ | ✓ |
 | Shanda Bambook (SNB) | ✓ | ✓ |
 | Comics: CBZ, CBR (stored pages), a folder of images, one image | ✓ (fixed layout) | ✓ CBZ, from books made of pictures |
+| LaTeX, reStructuredText, Org, AsciiDoc, MediaWiki, Typst | ✓ | ✓ |
+| DocBook (4 and 5), man pages, Textile | ✓ | ✓ (DocBook 5) |
+| DjVu (bundled and indirect) | ✓ (and `djvu.to_pdf`, `djvu.to_text`) | |
 
 Every book goes through one model, `bookport.Book`: metadata (title, authors, language, identifiers, publisher, date, description, subjects, series), a cover, a spine of XHTML documents, resources (images, stylesheets, fonts), a nested table of contents, landmarks and a page list. Anything read can be written to any writable format.
 
@@ -133,13 +141,17 @@ Every book goes through one model, `bookport.Book`: metadata (title, authors, la
 
 **Other formats.** DOCX reading follows styles (headings from style names and outline levels), numbered and bulleted lists, tables, images, hyperlinks, bookmarks, fields, footnotes and endnotes; writing makes real heading styles, lists, tables, images and internal links. RTF reading handles code pages per font, Unicode escapes, heading styles, tables, pictures, HYPERLINK fields, bookmarks and footnotes. CHM and LIT are decompressed with bookport's own LZX decoder; LIT's tokenized HTML and package are decoded into XHTML, metadata and TOC; LIT writing tokenizes them back, with the documents LZX-framed, a chapter tour from the TOC, the cover and images, and a directory that grows past one chunk for long books. LRF reading and writing cover pages, text blocks, italic and bold, images, the TOC object and the info block. eReader PDB and PMLZ carry the TOC (chapter index and PML headings), links, images and metadata. CBZ writing puts each page's pictures in reading order, with a ComicInfo.xml (title, series, writers, summary, publisher, genres, language, date, right-to-left reading, and the chapters as page bookmarks, which bookport reads back) and the same metadata as ComicBookInfo in the ZIP comment, where calibre's library looks for it; a book whose pages are text is refused, since a comic archive holds only pictures. `bookport.unpack` gives the files inside a CHM or LIT as they are stored (LIT pages in their tokenized form), for tools that extract them: for Python's 9 MB documentation CHM, the same 555 files as 7-Zip, byte for byte.
 
+**Markup languages.** LaTeX (sections, lists, tables with merged cells, figures, footnotes, theorems, the document's own macros, `\input` from its folder, cross-references numbered as LaTeX numbers them), reStructuredText with Sphinx's roles, Org, AsciiDoc with its includes and conditionals, MediaWiki, Typst, DocBook, man pages and Textile are read into the same `Book`, so each converts to every other format. Equations travel as MathML and are written as TeX, Typst, MathML or Word's own equations, whichever the format holds; BibTeX and BibLaTeX bibliographies turn `\cite`, `[@key]` and Org's citations into a reference list. Text formats that refer to pictures can write them beside themselves (`pictures=True`). What a reader can't turn into structure stays as text, and `Book.lost` says what was left out.
+
+**DjVu.** Black-and-white (JB2), photo (IW44) and compound pages, the OCR text layer, outlines and links are decoded by bookport. `bookport.djvu.to_pdf` keeps the scan's layers apart (black and white as JBIG2 or G4, backgrounds as JPEG) and lays the OCR text over them invisibly, so the PDF is searchable and about 15 times smaller than DjVuLibre's. The optional `bookport-native` package (built from `native/`) decodes pages many times faster; without it, the same pages come out of pure Python.
+
 **Images.** bookport decodes PNG, GIF and BMP itself and writes PNG, so formats that only take some image types get what they need. With Pillow installed it also converts WebP and TIFF.
 
 Errors: damaged or unsupported files raise `bookport.BookportError`, and nothing else; DRM raises `bookport.DRMError` (a subclass). An option a format doesn't take raises `BookportError` too, naming the options it does take. A failed write leaves no half-written file behind, and a finished one gets the permissions any new file would.
 
 **Books from anywhere.** bookport treats every book as hostile:
 
-- Pictures, stylesheets, covers and other pages that a book links to on disk (HTML, Markdown, PML, and the metadata of HTMLZ and TXTZ) are read only from the book's own folder and one level up, such as sibling `Text/` and `Images/` folders. Absolute paths, network (UNC) paths, `file:` links and anything further out are ignored. Inside an archive, links stay inside the archive.
+- Pictures, stylesheets, covers and other pages that a book links to on disk (HTML, Markdown, PML, the metadata of HTMLZ and TXTZ, and the includes and bibliographies of LaTeX, reStructuredText, AsciiDoc, Org and Typst) are read only from the book's own folder and one level up, such as sibling `Text/` and `Images/` folders. Absolute paths, network (UNC) paths, `file:` links and anything further out are ignored. Inside an archive, links stay inside the archive.
 - Everything one book unpacks to (ZIP members, zlib, bz2, LZX, HUFF/CDIC and PDF streams) is limited to 512 MB per part and 2 GB in all, pictures to 100 million pixels, elements to 128 levels of nesting, tables of contents to 32 levels and 100,000 entries, and PDF pages to a million content tokens. Real books are far below all of these.
 - XML with its own entity declarations (a DOCTYPE internal subset) is refused, so entities are never expanded.
 
@@ -151,17 +163,19 @@ bookport.convert(src, dst, fmt=None, **options) -> Path
 bookport.detect(path) -> str                          # "epub", "azw3", "pdf", ...
 bookport.formats() -> dict
 bookport.unpack(path, fmt=None) -> list[(name, bytes)]  # the files inside a CHM or LIT
+bookport.djvu.to_pdf(src, dst) -> Path                # a searchable PDF of a DjVu book
+bookport.djvu.to_text(src) -> str                     # its OCR text, as djvutxt gives it
 
 Book.write(path, fmt=None, **options) -> Path
 Book.metadata, Book.cover, Book.spine, Book.resources, Book.toc, Book.landmarks, Book.page_list
-Book.text(), Book.word_count(), Book.copy()
+Book.text(), Book.word_count(), Book.copy(), Book.lost  # what a reader left out
 ```
 
-Options: `page_size`, `text_size` (PDF); `version=2` (EPUB 2), `cover_page=False` (EPUB, no cover page); `compress=False` (Kindle, uncompressed text), `fonts=False` (Kindle, no embedded fonts); `format="doc"` or `"ztxt"` (PDB, default eReader); `newline`, `wrap`, `toc` (TXT); `encoding` (TXT and TCR, default UTF-8 with a byte-order mark). Other formats take no options.
+Options: `page_size`, `text_size` (PDF); `pictures=True` (text formats: write the pictures beside the file); `version=2` (EPUB 2), `cover_page=False` (EPUB, no cover page); `compress=False` (Kindle, uncompressed text), `fonts=False` (Kindle, no embedded fonts); `format="doc"` or `"ztxt"` (PDB, default eReader); `newline`, `wrap`, `toc` (TXT); `encoding` (TXT and TCR, default UTF-8 with a byte-order mark). Other formats take no options.
 
 ## How it's tested
 
-- **300 tests**, all passing on Python 3.13 with calibre and epubcheck installed (the tests that need those skip without them; PyMuPDF and fontTools come with the `dev` extra). Any warning fails a test. A sample book with every feature (two authors, series, cover, nested TOC, bold and italic, a list, a table, a figure, an internal link) is written to every format and read back: word recall, TOC entries, images, cover and metadata are checked per format.
+- **668 tests** (43 more skip without their tools), all passing on Python 3.13 with calibre and epubcheck installed (the tests that need those skip without them; PyMuPDF and fontTools come with the `dev` extra). Any warning fails a test. A sample book with every feature (two authors, series, cover, nested TOC, bold and italic, a list, a table, a figure, an internal link) is written to every format and read back: word recall, TOC entries, images, cover and metadata are checked per format.
 - **Against calibre 9.17 as an independent reader and writer**, in both directions: calibre reads bookport's EPUB, MOBI, AZW3, FB2, DOCX, RTF, PDF, PDB, PMLZ, TCR, RB, SNB, LRF and LIT output, and bookport reads calibre's output in every format calibre writes, LIT included.
 - **Against epubcheck 5.3.0**: zero errors on EPUBs made from the whole corpus, including from Kindle files.
 - **Against PyMuPDF** for PDF output (text, outline, links, metadata, where each kerned letter sits), and its encryption (AES-128, AES-256, RC4) for the PDF reader.
@@ -188,7 +202,8 @@ Code layout:
 
 - `src/bookport/book.py`: the Book model. `registry.py`: formats, detection, read, write, convert.
 - `src/bookport/markup.py`, `css.py`, `flow.py`, `clean.py`, `links.py`, `toc.py`, `text.py`: HTML parsing and writing, a CSS engine, styled blocks for non-HTML writers, XHTML5 cleanup, link rewriting.
-- `src/bookport/fmt/`: one module per format family.
+- `src/bookport/fmt/`: one module per format family; `textwriter.py`, `mathml.py`, `bib.py`: what the markup writers share (equations, citations).
+- `src/bookport/djvu/`: the DjVu decoders (ZP, BZZ, JB2, IW44, MMR), page compositing and the PDF writer; `native/`: the optional bookport-native package (Rust, PyO3), the same decoders compiled.
 - `src/bookport/pdf/`: the typesetter (`typeset.py`), TrueType subsetting (`ttf.py`), the PDF writer (`objects.py`) and reader (`parser.py`, `crypt.py`, `reader.py`).
 - `src/bookport/palm.py`, `mobi_index.py`, `lzx.py`, `images.py`: PDB, PalmDOC, HUFF/CDIC, Kindle indexes, LZX, image codecs.
 - `src/bookport/fonts/`: Noto Serif (four styles) and Noto Sans Mono, under the SIL Open Font License.

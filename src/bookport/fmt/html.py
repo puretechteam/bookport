@@ -70,10 +70,76 @@ def read(path, follow_links: bool = True, max_depth: int = 5, root=None) -> Book
         href = hrefs[p]
         _collect_resources(book, root, p, href, href_for, top)
         _rewrite_doc_links(root, p, href, hrefs, top)
+        footnotes(root)
         book.add_document(href, root, spine=True)
     _metadata_from_head(book, docs[0][1] if docs else None)
     book.ensure_toc()
     return book
+
+
+_NOTE_REF = {"footnote-ref", "footnote-reference", "noteref", "fnref"}
+_NOTE_BACK = {"footnote-back", "footnote-backref", "fn-backref", "footnote-backlink"}
+
+
+def footnotes(root: ET.Element) -> None:
+    """Footnotes as Pandoc, Python-Markdown, docutils and most site generators write them (calls marked
+    footnote-ref or role="doc-noteref", the notes as list items in a section or div of class "footnotes"
+    or role="doc-endnotes") become the book's: noteref links and ``<aside epub:type="footnote">``."""
+    parent = {c: p for p in root.iter() for c in p}
+    for a in root.iter("a"):
+        cls = set(a.get("class", "").split())
+        if cls & _NOTE_REF or a.get("role") == "doc-noteref":
+            a.set("class", " ".join(sorted((cls - _NOTE_REF) | {"noteref"})))
+            a.set("epub:type", "noteref")
+    holders = [el for el in root.iter() if el.tag in ("section", "div", "aside", "ol")
+               and (el.get("role") == "doc-endnotes" or {"footnotes", "footnote"} & set(el.get("class", "").split()))]
+    done: set[int] = set()
+    for holder in holders:
+        if any(id(anc) in done for anc in _ancestors(holder, parent)) or holder not in parent:
+            continue
+        done.add(id(holder))
+        items = [li for li in holder.iter("li") if li.get("id")]
+        if not items:
+            continue
+        asides = []
+        for li in items:
+            for a in list(li.iter("a")):
+                if set(a.get("class", "").split()) & _NOTE_BACK or a.get("role") == "doc-backlink" or \
+                        (a.get("href", "").startswith("#") and (a.text or "").strip() in ("↩", "↩︎", "^")):
+                    _drop(a, {c: p for p in li.iter() for c in p})
+            aside = ET.Element("aside", {"epub:type": "footnote", "id": li.get("id", "")})
+            aside.text = li.text
+            aside.extend(list(li))
+            asides.append(aside)
+        up = parent[holder]
+        at = list(up).index(holder)
+        tail = holder.tail
+        up.remove(holder)
+        for k, aside in enumerate(asides):
+            up.insert(at + k, aside)
+        if tail and tail.strip():
+            asides[-1].tail = tail
+
+
+def _ancestors(el: ET.Element, parent: dict):
+    while el in parent:
+        el = parent[el]
+        yield el
+
+
+def _drop(el: ET.Element, parent: dict) -> None:
+    """Remove an element, keeping its tail text."""
+    up = parent.get(el)
+    if up is None:
+        return
+    kids = list(up)
+    i = kids.index(el)
+    if el.tail:
+        if i:
+            kids[i - 1].tail = (kids[i - 1].tail or "") + el.tail
+        else:
+            up.text = (up.text or "") + el.tail
+    up.remove(el)
 
 
 def _collect_resources(book, root, p: Path, href, href_for, top):

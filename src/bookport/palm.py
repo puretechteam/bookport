@@ -281,18 +281,6 @@ def encode_vwi_forward(value: int) -> bytes:
     return bytes(reversed(out))
 
 
-def encode_vwi_backward(value: int) -> bytes:
-    """Backward-encoded VWI (trailing entries): the first byte has the high bit set."""
-    out = [value & 0x7F]
-    value >>= 7
-    while value:
-        out.append(value & 0x7F)
-        value >>= 7
-    out = list(reversed(out))
-    out[0] |= 0x80
-    return bytes(out)
-
-
 def trailing_size(record: bytes, flags: int) -> int:
     """Bytes of trailing entries at the end of a text record (MOBI 'extra data flags')."""
     size = 0

@@ -137,6 +137,7 @@ class Book:
         self.fixed_layout = False
         self.direction = ""  # "rtl" for right-to-left page progression
         self.source_format = ""
+        self.lost: list[str] = []  # what a reader left out or refused, said for people (an include outside the folder, ...)
         self._trees: dict[str, tuple[bytes, ET.Element]] = {}
 
     def __repr__(self) -> str:

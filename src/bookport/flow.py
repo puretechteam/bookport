@@ -35,6 +35,8 @@ class Run:
     image: str = ""  # inline image href
     alt: str = ""  # its alt text
     anchors: tuple = ()  # "doc.xhtml#id" targets that start here
+    math: ET.Element | None = None  # an equation (MathML); ``text`` holds it as TeX for writers without math
+    note: str = ""  # a footnote call: the key of the note it calls (writers that keep notes set data-note on the <a>)
 
     def same_style(self, o: Run) -> bool:
         return (self.bold, self.italic, self.underline, self.strike, self.sup, self.sub, self.mono, self.smallcaps,
@@ -77,6 +79,10 @@ class Block:
     quote: bool = False  # inside a blockquote
     offscreen: bool = False  # moved off the page by CSS (text kept for screen readers): skip on paged output
     line_height: float = 0.0  # multiple of the font size; 0 = writer default
+    list_key: int = 0  # the list a list item (or a paragraph inside one) belongs to; 0 outside lists
+    list_type: str = ""  # its CSS list-style-type: disc, decimal, lower-alpha, ...
+    list_start: int = 1  # the number its first item has
+    role: str = ""  # dt, dd, caption (of a table), figcaption
 
     def text(self) -> str:
         if self.kind == "table":
@@ -140,7 +146,6 @@ class _Walker:
         self.blocks: list[Block] = []
         self.cur: list[Run] = []
         self.pending_anchors: list[str] = []
-        self.block_ctx: list[dict] = []
         self.root = root
         body = root.find("body")
         self.base_size = cssmod.font_size(self.styles.get(body, {}).get("font-size"), 12.0) if body is not None else 12.0
@@ -173,6 +178,8 @@ class _Walker:
                 target = resolve(self.href, link)
                 frag = link.split("#", 1)[1] if "#" in link else ""
                 r.href = target + (f"#{frag}" if frag else "")
+                if self.book is not None and target not in self.book.resources:
+                    r.href = link  # not in the book: a relative web address, kept as written
         return r
 
     def _size(self, el) -> float:
@@ -206,7 +213,8 @@ class _Walker:
             return
         anchors = tuple(self.pending_anchors)
         self.pending_anchors = []
-        if self.cur and not anchors and not self.cur[-1].image and self.cur[-1].same_style(run) and self.cur[-1].text != "\n":
+        if self.cur and not anchors and not self.cur[-1].image and self.cur[-1].math is None and not self.cur[-1].note \
+                and self.cur[-1].same_style(run) and self.cur[-1].text != "\n":
             self.cur[-1].text += text
         else:
             self.cur.append(replace(run, text=text, anchors=anchors))
@@ -245,7 +253,8 @@ class _Walker:
                   margin_bottom=ctx.get("margin_bottom", 0.0),
                   size=ctx.get("size", 1.0), depth=ctx.get("depth", 0), doc=self.href,
                   quote=ctx.get("quote", False), line_height=ctx.get("line_height", 0.0),
-                  offscreen=ctx.get("offscreen", False))
+                  offscreen=ctx.get("offscreen", False), list_key=ctx.get("list_key", 0),
+                  list_type=ctx.get("list_type", ""), list_start=ctx.get("list_start", 1), role=ctx.get("role", ""))
         if ctx.get("marker") and ctx.get("first", True):
             b.marker = ctx["marker"]
         if ctx.get("page_break") and ctx.get("first", True):
@@ -294,6 +303,11 @@ class _Walker:
             return
         if el.get("id"):
             self.pending_anchors.append(f"{self.href}#{el.get('id')}")
+        if el.tag == "a" and el.get("data-note"):
+            anchors = tuple(self.pending_anchors)
+            self.pending_anchors = []
+            self.cur.append(Run(text="", note=el.get("data-note", ""), anchors=anchors))
+            return
         if el.tag == "a" and el.get("name") and not el.get("id"):
             self.pending_anchors.append(f"{self.href}#{el.get('name')}")
         tag = el.tag
@@ -312,17 +326,22 @@ class _Walker:
             if img is not None:
                 self._image(img, run, ctx, style)
             return
-        if tag in ("math", "object", "video", "audio", "iframe", "script", "style", "noscript"):
-            alt = el.get("alttext") or el.get("alt") or ""
-            if tag == "math":
-                alt = alt or " ".join("".join(el.itertext()).split())
-            self.add_text(alt, run, pre)
+        if tag == "math":
+            from .mathml import to_tex
+            tex = " ".join((el.get("alttext") or to_tex(el)).split())
+            if tex:
+                anchors = tuple(self.pending_anchors)
+                self.pending_anchors = []
+                self.cur.append(replace(run, text=tex, anchors=anchors, math=el))
+            return
+        if tag in ("object", "video", "audio", "iframe", "script", "style", "noscript"):
+            self.add_text(el.get("alttext") or el.get("alt") or "", run, pre)
             return
         if tag == "hr":
             self.flush(ctx)
             self.blocks.append(self._new_block({**ctx, "kind": "hr", "first": True, "marker": ""}))
             return
-        if display in ("table", "inline-table") and tag == "table":
+        if tag == "table":  # a table also when a style sheet shows it as a block (to let it scroll)
             self.flush(ctx)
             self._table(el, ctx)
             return
@@ -340,7 +359,9 @@ class _Walker:
         sub["first"] = True
         sub["size"] = rel
         sub.pop("alt", None)
-        sub["marker"] = ""
+        # a list item's marker goes on its first block, also when that is a paragraph inside it
+        sub["marker"] = ctx.get("marker", "") if ctx.get("kind") == "li" and ctx.get("first", True) \
+            and el.tag not in ("ul", "ol", "dl", "menu", "dir", "table") else ""
         if _offscreen(style):
             sub["offscreen"] = True
         tag = el.tag
@@ -355,6 +376,19 @@ class _Walker:
             sub["marker"] = self._marker(el, style)
         elif sub.get("kind") not in ("h", "pre", "li") or sub.get("kind") == "li":
             sub["kind"] = "p"
+        if tag in ("dt", "dd", "figcaption", "caption", "figure"):
+            sub["role"] = tag
+        if tag in ("ul", "ol", "menu", "dir"):
+            self._list_n = getattr(self, "_list_n", 0) + 1
+            sub["list_key"] = self._list_n
+            kind = style.get("list-style-type") or ("decimal" if tag == "ol" else "disc")
+            if tag == "ol" and el.get("type"):
+                kind = {"1": "decimal", "a": "lower-alpha", "A": "upper-alpha", "i": "lower-roman",
+                        "I": "upper-roman"}.get(el.get("type"), kind)
+            sub["list_type"] = kind
+            start = el.get("start", "")
+            sub["list_start"] = int(start) if tag == "ol" and start.lstrip("-").isdigit() else 1
+            sub["role"] = ""
         if tag in ("ul", "ol", "dl", "menu", "dir"):
             sub["depth"] = ctx.get("depth", 0) + 1
             if tag == "ol":
@@ -478,10 +512,10 @@ class _Walker:
 
 def _trim(runs: list[Run]) -> list[Run]:
     """Drop leading/trailing spaces (and empty runs) at the edges of a block; keep anchors."""
-    runs = [r for r in runs if r.text or r.image or r.anchors]
-    while runs and not runs[0].image and not runs[0].text.strip(" ") and not runs[0].anchors:
+    runs = [r for r in runs if r.text or r.image or r.anchors or r.note]
+    while runs and not runs[0].image and not runs[0].text.strip(" ") and not runs[0].anchors and not runs[0].note:
         runs.pop(0)
-    while runs and not runs[-1].image and not runs[-1].text.strip(" \n") and not runs[-1].anchors:
+    while runs and not runs[-1].image and not runs[-1].text.strip(" \n") and not runs[-1].anchors and not runs[-1].note:
         runs.pop()
     if runs and not runs[0].image:
         runs[0] = replace(runs[0], text=runs[0].text.lstrip(" "))
@@ -491,7 +525,7 @@ def _trim(runs: list[Run]) -> list[Run]:
     for i in range(1, len(runs)):
         if runs[i - 1].text.endswith(("\n", " ")) and runs[i].text.startswith(" "):
             runs[i] = replace(runs[i], text=runs[i].text.lstrip(" "))
-    if not any(r.text.strip() or r.image for r in runs):
+    if not any(r.text.strip() or r.image or r.note for r in runs):
         return []
     return runs
 

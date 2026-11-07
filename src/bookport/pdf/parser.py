@@ -652,7 +652,7 @@ class Document:
         return v
 
     # --- streams ------------------------------------------------------------------------------
-    def decode(self, stm: Stream, stop_at_image: bool = True) -> bytes:
+    def decode(self, stm: Stream) -> bytes:
         data = stm.raw
         if self.crypt is not None and stm.num and stm.dict.get("Type") != "XRef":
             data = self.crypt.decrypt(data, stm.num, stm.gen, stream=True)

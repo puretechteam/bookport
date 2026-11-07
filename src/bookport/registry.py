@@ -44,12 +44,28 @@ FORMATS: dict[str, tuple[str, str, bool, bool]] = {
     "md": ("markdown", "Markdown", True, True),
     "markdown": ("markdown", "Markdown", True, False),
     "docx": ("docx", "Word document (DOCX)", True, True),
-    "odt": ("odt", "OpenDocument text (ODT)", True, False),
+    "odt": ("odt", "OpenDocument text (ODT)", True, True),
+    "tex": ("latex", "LaTeX", True, True),
+    "latex": ("latex", "LaTeX", True, False),
+    "rst": ("rst", "reStructuredText", True, True),
+    "org": ("org", "Org", True, True),
+    "adoc": ("asciidoc", "AsciiDoc", True, True),
+    "asciidoc": ("asciidoc", "AsciiDoc", True, False),
+    "asc": ("asciidoc", "AsciiDoc", True, False),
+    "wiki": ("mediawiki", "MediaWiki", True, True),
+    "mediawiki": ("mediawiki", "MediaWiki", True, False),
+    "typ": ("typst", "Typst", True, True),
+    "dbk": ("docbook", "DocBook", True, True),
+    "docbook": ("docbook", "DocBook", True, False),
+    "man": ("man", "man page (roff)", True, True),
+    "textile": ("textile", "Textile", True, True),
     "rtf": ("rtf", "Rich Text Format", True, True),
     "pdf": ("pdf", "PDF", True, True),
     "cbz": ("comic", "Comic book ZIP", True, True),
     "cbr": ("comic", "Comic book RAR (stored pages)", True, False),
     "cb7": ("comic", "Comic book 7z", False, False),
+    "djvu": ("djvu", "DjVu", True, False),
+    "djv": ("djvu", "DjVu", True, False),
     "rb": ("rb", "Rocket eBook (RB)", True, True),
     "tcr": ("tcr", "Psion TCR", True, True),
     "snb": ("snb", "Shanda Bambook (SNB)", True, True),
@@ -93,6 +109,8 @@ def detect(path: str | os.PathLike) -> str:
         return "lit"
     if head[:4] == b"ITSF":
         return "chm"
+    if head[:8] == b"AT&TFORM":
+        return "djvu"
     if head[:6] == b"L\0R\0F\0":
         return "lrf"
     if head[:4] == b"SNBP":
@@ -119,13 +137,29 @@ def detect(path: str | os.PathLike) -> str:
         if kind[:4] in (b"TEXt", b"PNRd", b"Data", b"zTXT", b"BVok", b"ToGo", b"PPrs", b"SDoc") or kind in (b"TEXtREAd", b"PNRdPPrs", b"DataPlkr", b"zTXTGPlm"):
             return "pdb"
     if ext in FORMATS:
-        return {"htm": "html", "xhtml": "html", "markdown": "md", "text": "txt", "kepub": "epub"}.get(ext, ext)
+        return {"htm": "html", "xhtml": "html", "markdown": "md", "text": "txt", "kepub": "epub", "latex": "tex",
+                "asciidoc": "adoc", "asc": "adoc", "mediawiki": "wiki", "docbook": "dbk"}.get(ext, ext)
     low = head.lower()
     if b"<fictionbook" in low:
         return "fb2"
     if b"<html" in low or b"<!doctype html" in low:
         return "html"
+    if (b"docbook" in low and (b"<book" in low or b"<article" in low or b"<chapter" in low)) or \
+            (ext == "xml" and (b"<book" in low or b"<article" in low) and b"<para" in low):
+        return "dbk"
+    if _is_man(head):
+        return "man"  # a man page named by its section (ls.1, printf.3)
     return "txt"
+
+
+def _is_man(head: bytes) -> bool:
+    """roff with the man macros: comment lines, then .TH (or .so for a page that is another's alias)."""
+    for line in head.split(b"\n"):
+        s = line.strip()
+        if not s or s.startswith((b'.\\"', b"'\\\"", b'.\\#')):
+            continue
+        return s.startswith((b".TH ", b".TH\t", b".so "))
+    return False
 
 
 def _pdf_header(head: bytes) -> bool:

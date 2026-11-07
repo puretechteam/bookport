@@ -10,7 +10,6 @@ from bookport.fmt import mobi
 from bookport.mobi_index import CNCX, build_index, read_index
 from bookport.palm import (
     HuffCdic,
-    encode_vwi_backward,
     encode_vwi_forward,
     palmdoc_compress,
     palmdoc_decompress,
@@ -45,6 +44,18 @@ def test_palmdoc_decoder_survives_garbage():
 def test_vwi(value):
     enc = encode_vwi_forward(value)
     assert vwi_forward(enc + b"junk", 0) == (value, len(enc))
+
+
+def encode_vwi_backward(value: int) -> bytes:
+    """Backward-encoded VWI (trailing entries): the first byte has the high bit set."""
+    out = [value & 0x7F]
+    value >>= 7
+    while value:
+        out.append(value & 0x7F)
+        value >>= 7
+    out = list(reversed(out))
+    out[0] |= 0x80
+    return bytes(out)
 
 
 @pytest.mark.parametrize("payload", [0, 1, 50, 126, 127, 200, 5000])

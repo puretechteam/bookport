@@ -12,7 +12,7 @@ or from a terminal: ``bookport novel.mobi novel.epub``.
 
 from __future__ import annotations
 
-__version__ = "0.2.0"
+__version__ = "0.3.0"
 
 from .book import Book, Landmark, Metadata, Resource, TocEntry
 from .errors import BookportError, DRMError
@@ -33,3 +33,10 @@ __all__ = [
     "read",
     "unpack",
 ]
+
+
+def __getattr__(name: str):
+    if name == "djvu":  # bookport.djvu.to_pdf without importing the DjVu decoders up front
+        import importlib
+        return importlib.import_module(f"{__name__}.djvu")
+    raise AttributeError(f"module 'bookport' has no attribute {name!r}")
