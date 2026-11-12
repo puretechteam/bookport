@@ -116,14 +116,42 @@ def _parse_xml(text: str) -> ET.Element | None:
     return root if root.tag == "html" else None
 
 
-# a DOCTYPE with an internal subset ("[...]") is the only way a document can declare entities
-_INTERNAL_SUBSET = re.compile(r"""<!DOCTYPE(?:[^>\["']|"[^"]*"|'[^']*')*\[""", re.IGNORECASE)
+def whole(value) -> int | None:
+    """An attribute's whole number (ASCII digits, up to 9), or None: "²" passes str.isdigit() but int() refuses
+    it, and 5,000 digits pass both but are over int()'s limit, which failed the whole book."""
+    s = value or ""
+    return int(s) if s.isascii() and s.isdigit() and len(s) < 10 else None
+
+
+_DOCTYPE = re.compile(r"<!DOCTYPE", re.IGNORECASE)
+_DOCTYPE_PLAIN = re.compile(r"""[^>\["'<]*""")
 
 
 def has_internal_subset(text: str | bytes) -> bool:
+    """A DOCTYPE with an internal subset ("[...]"), the only way a document can declare entities. One with
+    a quote that never closes counts as one too, so in doubt the entities are never expanded. (A scan: a
+    regex for this looked to the end of the text from every DOCTYPE, which many unclosed ones made slow.)"""
     if isinstance(text, bytes):
         text = text.decode("latin-1")
-    return _INTERNAL_SUBSET.search(text) is not None
+    scanned = 0
+    for m in _DOCTYPE.finditer(text):
+        if m.start() < scanned:
+            continue  # inside a quoted name of the one before
+        i = m.end()
+        while True:
+            i = _DOCTYPE_PLAIN.match(text, i).end()
+            c = text[i:i + 1]
+            if c in ("'", '"'):
+                j = text.find(c, i + 1)
+                if j < 0:
+                    return True
+                i = j + 1
+            elif c == "[":
+                return True
+            else:  # ">", "<" (which can't come before the subset) or the end
+                break
+        scanned = i
+    return False
 
 
 def xml_parser() -> ET.XMLParser:
@@ -192,6 +220,20 @@ def _ensure_shell(root: ET.Element) -> ET.Element:
     return root
 
 
+def _cdata_to_text(text: str) -> str:
+    """CDATA sections as escaped text (a scan: a regex looked to the end from every unclosed one)."""
+    out, i = [], 0
+    while True:
+        j = text.find("<![CDATA[", i)
+        k = text.find("]]>", j + 9) if j >= 0 else -1
+        if k < 0:  # none left, or one that never closes: the rest as it is
+            out.append(text[i:])
+            return "".join(out)
+        out.append(text[i:j])
+        out.append(html.escape(text[j + 9:k], quote=False))
+        i = k + 3
+
+
 class HtmlBuilder(HTMLParser):
     """A forgiving HTML parser: implicit end tags, stray end tags ignored, entities decoded."""
 
@@ -203,7 +245,7 @@ class HtmlBuilder(HTMLParser):
 
     def build(self, text: str) -> ET.Element:
         text = _XML_DECL_STR.sub("", text, count=1)
-        text = re.sub(r"<!\[CDATA\[(.*?)\]\]>", lambda m: html.escape(m.group(1), quote=False), text, flags=re.DOTALL)
+        text = _cdata_to_text(text)
         # line breaks as an XML parser leaves them, so a page reads the same whichever parser read it
         self.feed(text.replace("\r\n", "\n").replace("\r", "\n"))
         self.close()
@@ -352,7 +394,7 @@ def _esc_attr(s: str) -> str:
     return s.replace("&", "&amp;").replace("<", "&lt;").replace('"', "&quot;").replace("\n", "&#10;")
 
 
-_XML_BAD = re.compile("[\x00-\x08\x0b\x0c\x0e-\x1f￾￿]")
+_XML_BAD = re.compile("[\x00-\x08\x0b\x0c\x0e-\x1f\ud800-\udfff￾￿]")  # and lone surrogates, which UTF-8 can't hold
 
 
 def clean_text(s: str) -> str:

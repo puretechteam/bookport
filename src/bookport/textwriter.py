@@ -41,6 +41,7 @@ INLINE_EMPH = {"em": "emph", "i": "emph", "cite": "emph", "dfn": "emph", "var": 
                "u": "underline", "ins": "underline", "sup": "sup", "sub": "sub"}
 CODE = {"code", "kbd", "samp", "tt"}
 SKIP = {"script", "style", "head", "title"}
+_SPACES = re.compile(r"[ \t\r\n\f]+")
 
 
 @dataclass
@@ -81,6 +82,9 @@ class TextWriter:
         self.book = book
         self.href = ""
         self.used_images: dict[str, str] = {}  # image href in the book -> name used in the text
+        self._names: set[str] = set()  # the names in used_images
+        self.out_dir = None  # the folder the text goes to (write_text sets it), so pictures don't overwrite files there
+        self._writing_notes: set[int] = set()
         self.notes: dict[str, ET.Element] = {}  # "doc.xhtml#id" -> aside
         self.targets: set[str] = set()
         for href, _ in book.documents():
@@ -110,7 +114,8 @@ class TextWriter:
         return self.join_document([p for p in parts if p and p.strip()])
 
     def join_document(self, parts: list[str]) -> str:
-        return re.sub(r"\n{3,}", "\n\n", "\n\n".join(parts)).strip("\n") + "\n"
+        # blank lines inside a part (a code block's) stay as they are
+        return "\n\n".join(p.strip("\n") for p in parts).strip("\n") + "\n"
 
     def preamble(self) -> str:
         return ""
@@ -199,9 +204,8 @@ class TextWriter:
         if tag == "blockquote":
             return self.quote(self.blocks(el))
         if tag in ("ul", "ol"):
-            start = el.get("start", "1")
             items = [self.list_item(li) for li in el if li.tag == "li"]
-            return self.list_block(items, tag == "ol", int(start) if start.lstrip("-").isdigit() else 1)
+            return self.list_block(items, tag == "ol", number(el.get("start"), 1, -10**6, 10**6))
         if tag == "dl":
             pairs: list[tuple[str, list[str]]] = []
             for c in el:
@@ -233,24 +237,20 @@ class TextWriter:
         cap = el.find("caption")
         if cap is not None:
             t.caption = " ".join(self.inlines(cap).split())
-        rows = [tr for tr in el.iter("tr")]
-        for tr in rows:
+        for tr in table_rows(el):
             row = []
             for c in tr:
                 if c.tag not in ("td", "th"):
                     continue
-                span = c.get("colspan", "1")
-                rspan = c.get("rowspan", "1")
                 align = c.get("align", "") or (re.search(r"text-align:\s*(\w+)", c.get("style", "")) or [None, ""])[1]
                 text = self.blocks(c) if self.has_blocks(c) else self.inlines(c)
                 row.append(Cell(" ".join(text.split()) if "\n" not in text.strip() else text.strip(),
-                                c.tag == "th",
-                                min(int(span), 50) if span.isdigit() and int(span) > 0 else 1,
-                                min(int(rspan), 500) if rspan.isdigit() and int(rspan) > 0 else 1, align))
+                                c.tag == "th", number(c.get("colspan"), 1, 1, 50), number(c.get("rowspan"), 1, 1, 500),
+                                align))
             t.rows.append(row)
         head = el.find("thead")
         if head is not None:
-            t.header_rows = len(head.findall(".//tr"))
+            t.header_rows = len(head.findall("tr"))
         elif t.rows and t.rows[0] and all(c.header for c in t.rows[0]):
             t.header_rows = 1
         return t
@@ -267,7 +267,7 @@ class TextWriter:
 
     def text(self, s: str) -> str:
         if self.collapse_space:
-            s = re.sub(r"\s+", " ", s)
+            s = _SPACES.sub(" ", s)  # not \s: no-break and thin spaces are text
         return self.escape(s)
 
     def inline(self, el: ET.Element) -> str:
@@ -321,13 +321,15 @@ class TextWriter:
         link = el.get("href", "")
         note = self.notes.get(f"{resolve(self.href, link.split('#')[0]) if link.split('#')[0] else self.href}#"
                               f"{link.split('#', 1)[1] if '#' in link else ''}")
-        if note is None:
+        if note is None or id(note) in self._writing_notes:  # a note that calls itself, or one calling it
             return self.inlines(el)
         saved, self.href = self.href, self._href_of(note)
+        self._writing_notes.add(id(note))
         try:
             body = self.blocks(note)
         finally:
             self.href = saved
+            self._writing_notes.discard(id(note))
         return self.footnote(_drop_backlink(body), note.get("id", ""))
 
     def _href_of(self, note: ET.Element) -> str:
@@ -349,11 +351,26 @@ class TextWriter:
             base = re.sub(r"[^\w.-]", "_", target.split("/")[-1])
             if not base.strip("."):  # "." or "..": never a name that leads out of the pictures' folder
                 base = "picture"
-            name = f"{self.image_dir}/{base}"
-            while name in self.used_images.values():
-                name = f"{self.image_dir}/{len(self.used_images)}_{base}"
+            name, n = f"{self.image_dir}/{base}", 0
+            while name in self._names or self._taken_on_disk(name, target):
+                n += 1
+                name = f"{self.image_dir}/{n}_{base}"
             self.used_images[target] = name
+            self._names.add(name)
         return name
+
+    def _taken_on_disk(self, name: str, target: str) -> bool:
+        """A different file already has this name in the folder the text is written to: never overwrite it."""
+        if self.out_dir is None:
+            return False
+        path = self.out_dir / name
+        if not path.exists():
+            return False
+        res = self.book.resources.get(target)
+        try:
+            return res is None or not path.is_file() or path.stat().st_size != len(res.data) or path.read_bytes() != res.data
+        except OSError:
+            return True
 
     # --- what subclasses write ----------------------------------------------------------------------
     def escape(self, s: str) -> str:
@@ -452,6 +469,8 @@ def write_text(writer: TextWriter, path, pictures: bool = False) -> list[str]:
     them; returns the names saved. Writers' ``write(book, path, pictures=False, **_)`` call this."""
     from pathlib import Path
     path = Path(path)
+    if pictures:
+        writer.out_dir = path.parent
     path.write_text(writer.write_book(), encoding="utf-8", newline="\n")
     saved = []
     if pictures:
@@ -460,10 +479,32 @@ def write_text(writer: TextWriter, path, pictures: bool = False) -> list[str]:
             if res is None or "://" in name or name.startswith("data:"):
                 continue
             target = path.parent / name
-            target.parent.mkdir(parents=True, exist_ok=True)
-            target.write_bytes(res.data)
+            if not target.exists():  # one that exists holds these very bytes (image_name made sure)
+                target.parent.mkdir(parents=True, exist_ok=True)
+                target.write_bytes(res.data)
             saved.append(name)
     return saved
+
+
+def table_rows(table: ET.Element) -> list[ET.Element]:
+    """The rows of this table, not of tables inside its cells."""
+    rows = []
+    for c in table:
+        if c.tag == "tr":
+            rows.append(c)
+        elif c.tag in ("thead", "tbody", "tfoot"):
+            rows.extend(r for r in c if r.tag == "tr")
+    return rows
+
+
+def number(value, default: int, lo: int, hi: int) -> int:
+    """An attribute's whole number (colspan, start), clamped; ``default`` when it isn't one ("²", "1e999", "")."""
+    s = (value or "").strip()
+    sign = -1 if s[:1] == "-" else 1
+    s = s.lstrip("+-")
+    if not (s.isascii() and s.isdigit()) or len(s) > 12:
+        return default if not (s.isascii() and s.isdigit()) else (hi if sign > 0 else lo)
+    return max(lo, min(hi, sign * int(s)))
 
 
 def _split_space(s: str) -> tuple[str, str, str]:

@@ -11,6 +11,7 @@ import itertools
 from collections import Counter
 from pathlib import Path
 
+from .. import limits
 from ..book import Book
 from ..errors import BookportError
 
@@ -29,7 +30,11 @@ def read(path) -> Book:
         n = data[pos]
         entries.append(data[pos + 1:pos + 1 + n])
         pos += 1 + n
-    raw = b"".join(entries[b] for b in data[pos:])
+    codes = data[pos:]
+    size = sum(len(entries[c]) * n for c, n in Counter(codes).items())  # each byte can stand for 255
+    limits.grow(size)
+    limits.charge(size)
+    raw = b"".join(entries[b] for b in codes)
     try:
         text = raw.decode("utf-8-sig")
     except UnicodeDecodeError:

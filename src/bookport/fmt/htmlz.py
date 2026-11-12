@@ -2,7 +2,6 @@
 
 from __future__ import annotations
 
-import io
 import posixpath
 import zipfile
 
@@ -29,6 +28,13 @@ def read(path) -> Book:
 def write(book: Book, path, **_) -> None:
     page = html_fmt.single_page(book, inline_images=False)
     images: dict[str, str] = {}
+
+    def free_name(href):
+        base = posixpath.basename(href)
+        name, k = "images/" + base, 1
+        while name in images.values():  # two files with one name in different folders
+            name, k = f"images/{k}_{base}", k + 1
+        return name
     # every resource the page uses moves under images/ (or stays a stylesheet inline)
     used = []
     for el in page.iter():
@@ -37,10 +43,7 @@ def write(book: Book, path, **_) -> None:
             if v and v in book.resources and not book.resources[v].is_document:
                 name = images.get(v)
                 if name is None:
-                    name = "images/" + posixpath.basename(v)
-                    while name in images.values():
-                        name = f"images/{len(images)}_{posixpath.basename(v)}"
-                    images[v] = name
+                    name = images[v] = free_name(v)
                     used.append(v)
                 el.set(attr, name)
     style = page.find("head/style")
@@ -51,12 +54,11 @@ def write(book: Book, path, **_) -> None:
     ET.SubElement(page.find("head"), "link", {"rel": "stylesheet", "type": "text/css", "href": "style.css"})
     for href in book.resources:
         if href in css and not book.resources[href].is_document and href not in images:
-            images[href] = "images/" + posixpath.basename(href)
+            images[href] = free_name(href)
     for href, name in images.items():
         css = css.replace(f'"{href}"', f'"{name}"')
     cover_name = None
-    buf = io.BytesIO()
-    with zipfile.ZipFile(buf, "w", zipfile.ZIP_DEFLATED) as z:
+    with zipfile.ZipFile(path, "w", zipfile.ZIP_DEFLATED) as z:  # straight to the file, not in memory first
         z.writestr("index.html", markup.serialize(page, xml_decl=False))
         z.writestr("style.css", css or "")
         for href, name in images.items():
@@ -66,5 +68,3 @@ def write(book: Book, path, **_) -> None:
             cover_name = "cover" + posixpath.splitext(cov.href)[1]
             z.writestr(cover_name, cov.data)
         z.writestr("metadata.opf", metadata_opf(book, cover_name))
-    with open(path, "wb") as f:
-        f.write(buf.getvalue())

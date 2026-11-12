@@ -9,9 +9,7 @@ gives the TOC), then any other pages; images and stylesheets as resources; the t
 from __future__ import annotations
 
 import posixpath
-import re
 import struct
-import xml.etree.ElementTree as ET
 from pathlib import Path
 from urllib.parse import unquote
 
@@ -23,6 +21,24 @@ from ..lzx import FRAME, LzxDecoder
 RESET_TABLE = "::DataSpace/Storage/MSCompressed/Transform/{7FC28940-9D31-11D0-9B27-00A0C91E9C7C}/InstanceData/ResetTable"
 CONTROL = "::DataSpace/Storage/MSCompressed/ControlData"
 CONTENT = "::DataSpace/Storage/MSCompressed/Content"
+
+
+# Windows ANSI code pages by primary language (the low 10 bits of an LCID); everything else is cp1252
+_CODEPAGES = {0x11: "cp932", 0x12: "cp949", 0x19: "cp1251", 0x22: "cp1251", 0x02: "cp1251", 0x23: "cp1251",
+              0x2F: "cp1251", 0x08: "cp1253", 0x1F: "cp1254", 0x0D: "cp1255", 0x01: "cp1256", 0x29: "cp1256",
+              0x20: "cp1256", 0x25: "cp1257", 0x26: "cp1257", 0x27: "cp1257", 0x2A: "cp1258", 0x1E: "cp874",
+              0x05: "cp1250", 0x15: "cp1250", 0x0E: "cp1250", 0x1B: "cp1250", 0x24: "cp1250", 0x18: "cp1250",
+              0x1C: "cp1250", 0x1A: "cp1250"}
+
+
+def codepage(lcid: int) -> str:
+    """The code page for a Windows language id (the one in a CHM's #SYSTEM)."""
+    lang = lcid & 0x3FF
+    if lang == 0x04:  # Chinese: traditional for Taiwan, Hong Kong and Macao, simplified otherwise
+        return "cp950" if lcid in (0x0404, 0x0C04, 0x1404) else "gbk"
+    if lcid in (0x0C1A, 0x1C1A, 0x201A):  # Serbian and Bosnian in Cyrillic
+        return "cp1251"
+    return _CODEPAGES.get(lang, "cp1252")
 
 
 def _encint(data: bytes, pos: int) -> tuple[int, int]:
@@ -146,18 +162,23 @@ def read(path) -> Book:
     book = Book(Metadata(title=stem))
     book.source_format = "chm"
     system = chm.read("/#SYSTEM") or b""
-    hhc_name = default = ""
+    entries = []
     pos = 4
     while pos + 4 <= len(system):
         code, length = struct.unpack("<HH", system[pos:pos + 4])
-        value = system[pos + 4:pos + 4 + length].split(b"\0", 1)[0].decode("cp1252", "replace")
+        entries.append((code, system[pos + 4:pos + 4 + length]))
+        pos += 4 + length
+    lcid = next((struct.unpack("<I", v[:4])[0] for c, v in entries if c == 4 and len(v) >= 4), 0)
+    cp = codepage(lcid)  # the text of a CHM is in its language's ANSI code page
+    hhc_name = default = ""
+    for code, raw in entries:
+        value = raw.split(b"\0", 1)[0].decode(cp, "replace")
         if code == 3 and value:
             book.metadata.title = value
         elif code == 2:
             default = value
         elif code == 0:
             hhc_name = value
-        pos += 4 + length
     names = [n for n in chm.files if n.startswith("/") and not n.startswith(("/#", "/$")) and not n.endswith("/")]
     if not hhc_name:
         hhc_name = next((n[1:] for n in names if n.lower().endswith(".hhc")), "")
@@ -177,7 +198,7 @@ def read(path) -> Book:
     if hhc_name:
         hhc = chm.read("/" + hhc_name.lstrip("/"))
         if hhc:
-            toc = _sitemap(markup.decode(hhc, "cp1252"), posixpath.dirname("/" + hhc_name.lstrip("/")))
+            toc = _sitemap(markup.decode(hhc, cp), posixpath.dirname("/" + hhc_name.lstrip("/")))
             for _d, e in [x for t in toc for x in t.walk()]:
                 page = e.href.split("#")[0]
                 if page:
@@ -188,7 +209,7 @@ def read(path) -> Book:
     spine = list(dict.fromkeys(page_set[p.lower()] for p in order if p.lower() in page_set))
     in_spine = set(spine)
     spine += sorted(p for p in pages if p not in in_spine)
-    added = {}
+    added, raw_pages = {}, {}
     for name in spine:
         data = chm.read(name)
         if data is None:
@@ -196,9 +217,12 @@ def read(path) -> Book:
         href = normalize_href(name)
         if not href.lower().endswith(".xhtml"):
             href = posixpath.splitext(href)[0] + ".xhtml"
-        added[name] = href
+        added[name], raw_pages[name] = href, data
+    # names in a CHM aren't case-sensitive: <a href="intro.htm"> finds /Pages/Intro.htm
+    added_lower = {k.lower(): k for k in reversed(added)}
+    hrefs_lower = {k.lower(): v for k, v in reversed(hrefs.items())}
     for name, href in added.items():
-        root = markup.parse(markup.decode(chm.read(name) or b"", "cp1252"))
+        root = markup.parse(markup.decode(raw_pages.pop(name), cp))
         base = normalize_href(name)
         for el in root.iter():
             for attr in ("href", "src"):
@@ -207,18 +231,16 @@ def read(path) -> Book:
                     continue
                 link, _, frag = unquote(v).partition("#")
                 link = link.split("::/")[-1] if "::/" in link else link
-                target = "/" + resolve(base, link)
-                if target in added:
-                    el.set(attr, relative(href, added[target] + (f"#{frag}" if frag else "")))
-                elif target in hrefs:
-                    el.set(attr, relative(href, hrefs[target]))
+                target = ("/" + resolve(base, link)).lower()
+                if target in added_lower:
+                    el.set(attr, relative(href, added[added_lower[target]] + (f"#{frag}" if frag else "")))
+                elif target in hrefs_lower:
+                    el.set(attr, relative(href, hrefs_lower[target]))
         if book.metadata.title == stem:
             t = root.find("head/title")
             if t is not None and (t.text or "").strip():
                 book.metadata.title = " ".join(t.text.split())
         book.add_document(href, root)
-
-    added_lower = {k.lower(): k for k in reversed(added)}
 
     def fix(entries):
         out = []
@@ -272,4 +294,4 @@ def _sitemap(html: str, base_dir: str) -> list[TocEntry]:
     return items(first) if first is not None else []
 
 
-__all__ = ["ET", "Chm", "re", "read"]
+__all__ = ["Chm", "read"]

@@ -9,7 +9,9 @@ from . import markup
 from .book import CSS, Book, is_external, normalize_href, relative, resolve
 
 LINK_ATTRS = ("href", "src", "xlink:href", "poster", "data")
-_URL = re.compile(r"""url\(\s*(['"]?)([^'")]+)\1\s*\)""", re.IGNORECASE)
+# the address is words with single runs of space between them, so the spaces around it can't be split
+# between it and the \s* in more than one way (a long run of spaces took cubic time)
+_URL = re.compile(r"""url\(\s*(['"]?)([^'")\s]+(?:\s+[^'")\s]+)*)\1\s*\)""", re.IGNORECASE)
 _IMPORT = re.compile(r"""@import\s+(['"])([^'"]+)\1""", re.IGNORECASE)
 
 

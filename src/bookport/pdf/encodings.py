@@ -97,10 +97,7 @@ def glyph_to_unicode(name: str) -> str | None:
             return unicodedata.lookup(f"GREEK {'CAPITAL' if base[0].isupper() else 'SMALL'} LETTER {low.upper()}")
         except KeyError:
             return None
-    m = re.fullmatch(r"(?:g|cid|glyph|index)?(\d+)", base)
-    if m:
-        return None
-    return None
+    return None  # g12, cid12, glyph12, index12: a glyph number says nothing about the character
 
 
 def _build(names_by_code: dict[int, str], base: dict[int, str] | None = None) -> dict[int, str]:

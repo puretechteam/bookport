@@ -10,12 +10,11 @@ from __future__ import annotations
 
 import re
 import struct
-import xml.etree.ElementTree as ET
 import zlib
 from pathlib import Path
 
 from .. import limits, markup
-from ..book import Book, Metadata, is_external, relative, resolve, sniff_image
+from ..book import Book, Metadata, relative, sniff_image
 from ..errors import BookportError
 
 MAGIC = b"\xb0\x0c\xb0\x0c\x02\x00NUVO\x00\x00\x00\x00"
@@ -62,13 +61,18 @@ def read(path) -> Book:
         if sniff_image(entries[name]):
             images[name] = book.add("images/" + re.sub(r"[^\w.-]", "_", name), entries[name]).href
     pages = [n for n in order if n.lower().endswith((".html", ".htm"))]
-    for k, name in enumerate(pages, 1):
+    page_href = {name.lower(): f"text/part{k:04d}.xhtml" for k, name in enumerate(pages, 1)}
+    for name in pages:
         root = markup.parse(markup.decode(entries[name], "cp1252"))
-        href = f"text/part{k:04d}.xhtml"
+        href = page_href[name.lower()]
         for el in root.iter("img"):
             src = el.get("src", "")
             if src in images:
                 el.set("src", relative(href, images[src]))
+        for el in root.iter("a"):  # pages are renamed, so links between them are too
+            page, sep, frag = el.get("href", "").partition("#")
+            if page.lower() in page_href:
+                el.set("href", relative(href, page_href[page.lower()]) + sep + frag)
         book.add_document(href, root)
     if not book.spine:
         raise BookportError("This RB file has no pages")
@@ -142,7 +146,8 @@ def write(book: Book, path, **_) -> None:
     parts.append("</BODY></HTML>")
     html = "\n".join(parts).encode("cp1252", "xmlcharrefreplace")
     md = book.metadata
-    info = f"TYPE=2\nTITLE={md.title}\nAUTHOR={'; '.join(md.authors)}\n"
+    # one line per key: a line break in the title would start a key of its own
+    info = f"TYPE=2\nTITLE={' '.join(md.title.split())}\nAUTHOR={' '.join('; '.join(md.authors).split())}\n"
     # the other keys a Rocket eBook's info page has
     for key, value in (("PUBLISHER", md.publisher), ("COPYRIGHT", md.rights), ("ISBN", md.identifiers.get("isbn", ""))):
         if value:
@@ -189,4 +194,4 @@ def _runs(runs, image) -> str:
     return "".join(out)
 
 
-__all__ = ["ET", "is_external", "read", "resolve", "write"]
+__all__ = ["read", "write"]

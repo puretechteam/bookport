@@ -13,7 +13,7 @@ from .palm import encode_vwi_forward, vwi_forward
 
 
 def _bits(x: int) -> int:
-    return x.bit_count() if hasattr(x, "bit_count") else bin(x).count("1")  # noqa: FURB161
+    return x.bit_count() if hasattr(x, "bit_count") else bin(x).count("1")
 
 
 def parse_tagx(rec: bytes, start: int):
@@ -57,6 +57,8 @@ def _entry_tags(data: bytes, pos: int, control_bytes: int, tagx) -> dict[int, li
         values = []
         if count is not None:
             for _ in range(count * per_entry):
+                if pos >= len(data):  # past the entry: a damaged count would add zeros for ever
+                    break
                 v, used = vwi_forward(data, pos)
                 pos += used
                 values.append(v)
@@ -174,9 +176,8 @@ def _control_and_values(tagx, tags: dict[int, list[int]], control_bytes: int):
         else:
             cbytes[ci] |= mask
             encoded = b"".join(encode_vwi_forward(v) for v in vals)
-            values += encode_vwi_forward(len(encoded))
-            for v in vals:
-                pass
+            values += encode_vwi_forward(len(encoded)) + encoded  # a byte count, then the values
+            continue
         for v in vals:
             values += encode_vwi_forward(v)
     return bytes(cbytes), bytes(values)

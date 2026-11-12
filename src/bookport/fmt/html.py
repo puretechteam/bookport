@@ -6,6 +6,7 @@ import base64
 import os
 import re
 import xml.etree.ElementTree as ET
+from collections import deque
 from pathlib import Path
 from urllib.parse import unquote
 
@@ -39,14 +40,20 @@ def read(path, follow_links: bool = True, max_depth: int = 5, root=None) -> Book
         hrefs[p] = book.unique_href(rel.replace(" ", "_"))
         return hrefs[p]
 
-    queue = [(start, 0)]
-    seen: set[Path] = set()
+    found: dict[tuple[Path, str], Path | None] = {}
+
+    def locate(folder: Path, link: str) -> Path | None:
+        # each link is looked up on disk once: a page linking to one page thousands of times did it each time
+        key = (folder, link.split("#", 1)[0])
+        if key not in found:
+            found[key] = safe_path(folder, link, top)
+        return found[key]
+
+    queue = deque([(start, 0)])
+    queued: set[Path] = {start}
     docs: list[tuple[Path, ET.Element]] = []
-    while queue and len(seen) < MAX_FILES:
-        p, depth = queue.pop(0)
-        if p in seen:
-            continue
-        seen.add(p)
+    while queue and len(docs) < MAX_FILES:
+        p, depth = queue.popleft()
         try:
             data = p.read_bytes()
         except OSError:
@@ -59,8 +66,10 @@ def read(path, follow_links: bool = True, max_depth: int = 5, root=None) -> Book
             link = a.get("href", "")
             if not link or is_external(link) or link.startswith("#"):
                 continue
-            target = safe_path(p.parent, link, top)
-            if target is not None and target.suffix.lower() in (".html", ".htm", ".xhtml", ".shtml") and target.is_file():
+            target = locate(p.parent, link)
+            if target is not None and target not in queued and target.suffix.lower() in (".html", ".htm", ".xhtml",
+                                                                                          ".shtml") and target.is_file():
+                queued.add(target)
                 queue.append((target, depth + 1))
     # documents in the order found; resources they use
     for p, root in docs:
@@ -68,8 +77,8 @@ def read(path, follow_links: bool = True, max_depth: int = 5, root=None) -> Book
         hrefs[p] = href
     for p, root in docs:
         href = hrefs[p]
-        _collect_resources(book, root, p, href, href_for, top)
-        _rewrite_doc_links(root, p, href, hrefs, top)
+        _collect_resources(book, root, p, href, href_for, locate)
+        _rewrite_doc_links(root, p, href, hrefs, locate)
         footnotes(root)
         book.add_document(href, root, spine=True)
     _metadata_from_head(book, docs[0][1] if docs else None)
@@ -142,12 +151,12 @@ def _drop(el: ET.Element, parent: dict) -> None:
     up.remove(el)
 
 
-def _collect_resources(book, root, p: Path, href, href_for, top):
+def _collect_resources(book, root, p: Path, href, href_for, locate):
     for el in root.iter():
         for attr in ("src", "xlink:href", "poster"):
             v = el.get(attr)
             if v and not is_external(v) and not v.startswith("data:"):
-                el.set(attr, _add_file(book, p, v, href, href_for, top))
+                el.set(attr, _add_file(book, p, v, href, href_for, locate))
             elif v and v.startswith("data:") and el.tag in ("img", "image"):
                 res = _data_uri(book, v)
                 if res is not None:
@@ -155,11 +164,11 @@ def _collect_resources(book, root, p: Path, href, href_for, top):
         if el.tag == "link" and "stylesheet" in el.get("rel", "").lower():
             v = el.get("href", "")
             if v and not is_external(v):
-                el.set("href", _add_file(book, p, v, href, href_for, top, css=True))
+                el.set("href", _add_file(book, p, v, href, href_for, locate, css=True))
         if el.tag == "style" and el.text:
             for u in css_urls(el.text):
                 if not is_external(u) and not u.startswith("data:"):
-                    new = _add_file(book, p, u, href, href_for, top)
+                    new = _add_file(book, p, u, href, href_for, locate)
                     el.text = el.text.replace(u, new)
 
 
@@ -176,8 +185,8 @@ def _data_uri(book, uri):
     return book.add(f"images/inline{len(book.resources)}{IMAGE_EXT.get(mt, '.bin')}", data, mt).href
 
 
-def _add_file(book, page: Path, link: str, href, href_for, top, css=False) -> str:
-    target = safe_path(page.parent, link, top)
+def _add_file(book, page: Path, link: str, href, href_for, locate, css=False) -> str:
+    target = locate(page.parent, link)
     if target is None or not target.is_file():
         return link
     rhref = href_for(target)
@@ -188,7 +197,7 @@ def _add_file(book, page: Path, link: str, href, href_for, top, css=False) -> st
             text = markup.decode(data)
             for u in css_urls(text):
                 if not is_external(u) and not u.startswith("data:"):
-                    sub = safe_path(target.parent, u, top)
+                    sub = locate(target.parent, u)
                     if sub is not None and sub.is_file():
                         sub_href = href_for(sub)
                         if sub_href not in book.resources:
@@ -200,13 +209,13 @@ def _add_file(book, page: Path, link: str, href, href_for, top, css=False) -> st
     return relative(href, rhref)
 
 
-def _rewrite_doc_links(root, p: Path, href, hrefs, top):
+def _rewrite_doc_links(root, p: Path, href, hrefs, locate):
     for a in root.iter("a"):
         link = a.get("href", "")
         if not link or is_external(link) or link.startswith("#"):
             continue
         frag = link.partition("#")[2]
-        target = safe_path(p.parent, link, top)
+        target = locate(p.parent, link)
         if target in hrefs:
             a.set("href", relative(href, hrefs[target] + (f"#{frag}" if frag else "")))
 

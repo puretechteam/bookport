@@ -86,6 +86,12 @@ def _local(tag) -> str:
     return tag.rsplit("}", 1)[-1] if isinstance(tag, str) else ""
 
 
+def _whole(value) -> int | None:
+    """A whole number in ASCII digits (up to 9), or None ("²" and 5,000 digits both make int() fail)."""
+    s = value or ""
+    return int(s) if s.isascii() and s.isdigit() and len(s) < 10 else None
+
+
 def _kids(el: ET.Element) -> list[ET.Element]:
     return [c for c in el if isinstance(c.tag, str)]
 
@@ -210,7 +216,7 @@ INTEGRALS = set("∫∬∭⨌∮∯∰")  # scripts at the side even in display
 BIG_CHARS = set(TEX_BIG.values())
 
 FUNCTIONS = set("""arccos arcsin arctan arg cos cosh cot coth csc deg det dim exp gcd hom inf ker lg lim liminf limsup ln
-log max min Pr sec sin sinh sup tan tanh injlim projlim""".split())  # noqa: SIM905
+log max min Pr sec sin sinh sup tan tanh injlim projlim""".split())
 LIMIT_FUNCTIONS = {"det", "gcd", "inf", "lim", "liminf", "limsup", "max", "min", "Pr", "sup", "injlim", "projlim"}
 
 SPACES = {",": "0.167em", "thinspace": "0.167em", ":": "0.222em", ">": "0.222em", "medspace": "0.222em",
@@ -378,7 +384,7 @@ class _TexParser:
         k = 0
         while k < len(btoks):
             t = btoks[k]
-            if t == "#" and k + 1 < len(btoks) and btoks[k + 1].isdigit():
+            if t == "#" and k + 1 < len(btoks) and btoks[k + 1].isdecimal():
                 n = int(btoks[k + 1]) - 1
                 out += args[n] if 0 <= n < len(args) else []
                 k += 2
@@ -960,13 +966,19 @@ _TEXT_ACCENTS = {'"': 0x308, "'": 0x301, "`": 0x300, "^": 0x302, "~": 0x303, "="
                  "v": 0x30C, "u": 0x306, "H": 0x30B, "r": 0x30A, "k": 0x328}
 
 
+_HIDE_BRACES = str.maketrans({"{": "\x01", "}": "\x02", "\\": "\x03"})
+_SHOW_BRACES = str.maketrans({"\x01": "{", "\x02": "}", "\x03": "\\"})
+
+
 def _text_unescape(s: str) -> str:
     s = re.sub(r"\\([\"'`^~=.]|[cvuHrk](?![A-Za-z]))\s*\{?([A-Za-z])\}?",
                lambda m: unicodedata.normalize("NFC", m.group(2) + chr(_TEXT_ACCENTS[m.group(1)])), s)
     s = re.sub(r"\\[;:!>]", " ", s)
-    s = re.sub(r"\\textbackslash\b|\\[%&_#${} ,]|---|--|``|''|~", lambda m: _TEXT_ESC.get(m.group(0), m.group(0)), s)
+    # what the escapes stand for is kept apart until the bare braces are gone: \{x\} came out as "x"
+    s = re.sub(r"\\textbackslash\b|\\[%&_#${} ,]|---|--|``|''|~",
+               lambda m: _TEXT_ESC.get(m.group(0), m.group(0)).translate(_HIDE_BRACES), s)
     s = re.sub(r"\\[A-Za-z]+\*?\s*", "", s)  # \emph{x} inside text keeps x
-    return re.sub(r"(?<!\\)[{}]", "", s)
+    return re.sub(r"(?<!\\)[{}]", "", s).translate(_SHOW_BRACES)
 
 
 def from_tex(tex: str, display: bool = False, macros: dict | None = None) -> ET.Element:
@@ -1811,7 +1823,7 @@ class _FromOmml:
             for mc in list(mcs) if mcs is not None else []:
                 if _local(mc.tag) == "mc":
                     count = _val(_child(mc, "mcPr"), "count") or "1"
-                    aligns += [_val(_child(mc, "mcPr"), "mcJc") or "center"] * min(int(count) if count.isdigit() else 1, 1000)
+                    aligns += [_val(_child(mc, "mcPr"), "mcJc") or "center"] * min(1 if _whole(count) is None else _whole(count), 1000)
             rows = [[self.items(x) for x in mr if _local(x.tag) == "e"] for mr in el if _local(mr.tag) == "mr"]
             return [_mtable(rows, aligns or ["center"])]
         if tag == "eqArr":
@@ -2504,7 +2516,7 @@ omicron pi rho sigma tau upsilon phi phi.alt chi psi omega Gamma Delta Theta Lam
 infinity partial nabla ell aleph emptyset sum product integral integral.double integral.triple integral.cont union.big
 sect.big arrow.r arrow.l arrow.l.r arrow.r.double arrow.l.double arrow.l.r.double arrow.r.bar arrow.t arrow.b lt.eq
 gt.eq eq.not approx equiv in in.not subset subset.eq supset supset.eq union sect times div plus.minus minus.plus
-dot.op forall exists not and or dots.h dots.c dots.v dots.down prime""".split())  # noqa: SIM905
+dot.op forall exists not and or dots.h dots.c dots.v dots.down prime""".split())
 TYPST_NAME = {v: k for k, v in reversed(list(TYPST_SYM.items())) if k in _TYPST_STABLE}
 TYPST_NAME.update({"−": "-", "/": "\\/", "_": "\\_", "^": "\\^", "&": "\\&", "#": "\\#", "$": "\\$",
                    "\\": "backslash", "\"": "\\\"", "′": "prime", "∂": "partial", "∞": "infinity", "∅": "emptyset",

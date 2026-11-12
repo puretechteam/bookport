@@ -3,8 +3,9 @@
 Reading covers the markup (headings, emphasis, raw text and blocks, lists, enums, term lists,
 math, labels and references, line breaks, escapes, comments) and the common element functions
 (link, image, figure, table and grid, footnote, quote, heading, emph/strong/strike/..., raw,
-lorem, cite, ref, bibliography, include). It does not run Typst's scripting language: #set, #show,
-#import and functions it doesn't know stay as raw Typst (and are listed in ``book.lost``); simple
+lorem, cite, ref, bibliography, include). It does not run Typst's scripting language: #set and #show
+rules are dropped (``#set document(title:, author:)`` becomes the book's title and authors; the rest is
+listed in ``book.lost``), #import and functions it doesn't know stay as raw Typst (also listed); simple
 ``#let name = value`` variables are substituted.
 """
 
@@ -47,6 +48,24 @@ _PASS = {"align", "block", "box", "pad", "text", "par", "columns", "rect", "squa
          "set", "page", "colbreak", "upper", "lower", "lang", "metadata", "html.elem", "html.div", "html.span"}
 
 
+def _math_end(src: str, i: int) -> int:
+    """The index of the "$" that closes math starting at ``src[i]`` (or the end): escapes and "strings"
+    inside it are skipped, so $"costs $5"$ is one equation, not one that ends at the 5."""
+    n = len(src)
+    k = i
+    while k < n and src[k] != "$":
+        if src[k] == "\\":
+            k += 2
+        elif src[k] == '"':
+            k += 1
+            while k < n and src[k] != '"':
+                k += 2 if src[k] == "\\" else 1
+            k += 1
+        else:
+            k += 1
+    return min(k, n)
+
+
 def _match(src: str, i: int) -> int:
     """The index just after the bracket that closes the one at ``src[i]`` (or the end): strings
     and comments in code, escapes, raw text and math in markup are skipped, not counted."""
@@ -75,10 +94,7 @@ def _match(src: str, i: int) -> int:
             k = src.find(m.group(0), j + len(m.group(0)))
             j = n if k < 0 else k + len(m.group(0)) - 1
         elif not code and ch == "$":
-            k = j + 1
-            while k < n and src[k] != "$":
-                k += 2 if src[k] == "\\" else 1
-            j = k
+            j = _math_end(src, j + 1)
         elif ch in closes:
             stack.append(ch)
             if len(stack) > MAX_DEPTH * 4:
@@ -200,10 +216,12 @@ class _Reader:
                 i = j + 1
                 continue
             m = _RAW_FENCE.match(line)
+            close = src.find(m.group(1), i + len(line) - len(line.lstrip()) + len(m.group(1))) if m else -1
+            if m and 0 <= close < eol and src[close + len(m.group(1)):eol].strip():
+                m = None  # ```py x``` and more text on the line: raw text inside a paragraph, not a block
             if m:
                 end_para()
                 fence = m.group(1)
-                close = src.find(fence, i + len(line) - len(line.lstrip()) + len(fence))
                 body = src[eol + 1:close if close >= 0 else n]
                 if close >= 0 and close < eol:  # ```lang text``` on one line
                     body = src[i:close].lstrip()[len(fence) + len(m.group(2)):]
@@ -280,10 +298,7 @@ class _Reader:
                 j = max(_expr_end(src, j), j + 1)
                 continue
             if ch == "$":
-                k = j + 1
-                while k < n and src[k] != "$":
-                    k += 2 if src[k] == "\\" else 1
-                j = k + 1
+                j = _math_end(src, j + 1) + 1
                 continue
             if ch == "`":
                 m = re.match(r"`+", src[j:])
@@ -371,14 +386,18 @@ class _Reader:
         return m.group(1) if m and "<p>" not in m.group(1) else inner
 
     def statement(self, expr: str, block: bool) -> str:
-        """#set, #show, #import, #let or #include: kept as raw Typst (a #let of a plain value is used)."""
+        """#set, #show, #import, #let or #include: #set and #show are dropped (a #set document gives the title and
+        authors), the others kept as raw Typst (a #let of a plain value is used, an #include read in)."""
         kind = expr[1:].split(None, 1)[0].split("(")[0]
         if kind == "include":
             return self.include(expr) if block else ""
         if kind == "let" and self.let(expr):
             return ""
-        if kind == "set":
-            self.set_rule(expr)
+        if kind in ("set", "show"):
+            if kind == "set" and self.set_rule(expr):
+                return ""
+            self.lose(kind, f"Typst #{kind} rules were left out, not applied.")
+            return ""
         if kind == "let":
             self.lose("let", "Typst #let definitions that compute something were kept as text, not run.")
         else:
@@ -417,17 +436,20 @@ class _Reader:
             return False
         return True
 
-    def set_rule(self, expr: str) -> None:
+    def set_rule(self, expr: str) -> bool:
+        """Takes the title and authors from a #set document(...); False for any other #set. The first one
+        given for each wins."""
         m = re.match(r"#set\s+document\((.*)\)", expr.strip(), re.DOTALL)
         if not m:
-            return
+            return False
         for part in _split_args(m.group(1)):
             k, _, v = part.partition(":")
             v = v.strip()
-            if k.strip() == "title":
+            if k.strip() == "title" and not self.title:
                 self.title = _unquote(v) if v.startswith('"') else _strip_tags(self.inline(v[1:-1])) if v.startswith("[") else ""
-            elif k.strip() == "author":
+            elif k.strip() == "author" and not self.authors:
                 self.authors = [_unquote(x) for x in re.findall(r'"(?:[^"\\]|\\.)*"', v)]
+        return True
 
     def include(self, expr: str) -> str:
         m = re.search(r'"((?:[^"\\]|\\.)*)"', expr)
@@ -546,7 +568,7 @@ class _Reader:
             return self.table(values, named)
         if name == "heading":
             level = named.get("level") or named.get("depth") or "1"
-            level = min(max(int(level), 1), 6) if level.isdigit() else 1
+            level = 1 if markup.whole(level) is None else min(max(markup.whole(level), 1), 6)
             return f"<h{level}>{self.value(first)}</h{level}>"
         if name == "quote":
             inner = self.value(first, block=True)
@@ -568,10 +590,14 @@ class _Reader:
                 return "<dl>" + "".join(self._term(v) for v in values) + "</dl>"
             return f"<{tag}>" + "".join(f"<li>{self.value(_item_of(v))}</li>" for v in values) + f"</{tag}>"
         if name == "lorem":
-            k = int(first) if first.isdigit() else 0
+            k = int(first) if first.isascii() and first.isdigit() and len(first) < 10 else 0
             k = min(k, 100_000)
-            words = [_LOREM[i % len(_LOREM)] for i in range(k)]
-            return html.escape(" ".join(words))
+            words = " ".join(_LOREM[i % len(_LOREM)] for i in range(k))
+            self.budget -= len(words)  # counted like #let text: 40 short calls made 28 million characters
+            if self.budget < 0:
+                self.lose("expansion", "Generated text past the size limit was left out.")
+                return ""
+            return html.escape(words)
         if name == "cite":
             keys = [m.group(1) for m in _LABEL.finditer(" ".join(values))]
             return self.citation(keys)
@@ -609,8 +635,8 @@ class _Reader:
 
     def table(self, values: list[str], named: dict[str, str]) -> str:
         cols = named.get("columns", "1").strip()
-        if cols.isdigit():
-            width = max(1, min(int(cols), 1000))
+        if markup.whole(cols) is not None:
+            width = max(1, min(markup.whole(cols), 1000))
         elif cols.startswith("("):
             width = max(1, len(_split_args(cols[1:-1])))
         else:
@@ -748,9 +774,7 @@ class _Reader:
                 i = k + len(ticks)
                 continue
             if ch == "$":
-                k = i + 1
-                while k < n and text[k] != "$":
-                    k += 2 if text[k] == "\\" else 1
+                k = _math_end(text, i + 1)
                 out.append(self.math(text[i + 1:k]))
                 i = k + 1
                 continue
@@ -936,10 +960,6 @@ class _TypstWriter(TextWriter):
 
     def preamble(self) -> str:
         md = self.book.metadata
-        for href, _ in self.book.documents():
-            for pre in self.book.tree(href).iter("pre"):
-                if pre.get("data-format") == "typst" and markup.text_of(pre).lstrip().startswith("#set document"):
-                    return ""  # read from Typst: its own #set document comes back as it was
         args = []
         if md.title:
             args.append(f"title: {_quote(md.title)}")

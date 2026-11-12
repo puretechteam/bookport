@@ -190,7 +190,11 @@ def write(book: Book, path, fmt: str = "pdb", format: str = "ereader", **_) -> N
 
 def _plain_text(book: Book) -> bytes:
     from .txt import book_to_text
-    return book_to_text(book).replace("\n", "\r\n").encode("cp1252", "replace")
+    text = book_to_text(book).replace("\n", "\r\n")
+    try:
+        return text.encode("cp1252")  # what older Palm readers expect
+    except UnicodeEncodeError:
+        return text.encode("utf-8")  # anything else (Cyrillic, Greek, CJK): the readers here detect UTF-8
 
 
 def _write_palmdoc(book: Book) -> bytes:

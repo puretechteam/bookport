@@ -25,6 +25,9 @@ from .mediawiki import attr, esc, html_book
 
 MAX_SO_DEPTH = 8
 MAX_LINES = 2_000_000
+MAX_STRING = 65_536  # one string (.ds)
+MAX_EXPANDED = 16_000_000  # characters strings and macros may produce for one page, all told
+_STRING_REF = re.compile(r"\\\*(?:\[([^\]\n]*)\]|\((..)|([^\[(\n]))")
 MAX_RS = 32
 
 # roff special characters (\(xx and \[name]) that man pages use
@@ -116,6 +119,7 @@ class _Man:
         self.lost: list[str] = []
         self.unknown: dict[str, int] = {}
         self.strings = dict(STRINGS)
+        self.expanded_chars = 0  # text strings and macros have produced: bounded for the page
         self.meta = Metadata()
         self.blocks: list[list] = [["body", []]]  # open containers: [kind, parts, extra]
         self.para: list[tuple] = []  # inline pieces of the paragraph being read: ("t", font, text) / ("h", html)
@@ -263,7 +267,7 @@ class _Man:
 
     def expand(self, name: str, rest: str, it, depth: int) -> None:
         """Run a macro the page defined: its lines, with \\$1... replaced by the arguments."""
-        if self.expanding >= 8 or self.expanded > 200_000:
+        if self.expanding >= 8 or self.expanded > 200_000 or self.expanded_chars > MAX_EXPANDED:
             self.lost_once("Macros that call themselves too deeply were stopped")
             return
         args = _unq(rest)
@@ -280,6 +284,10 @@ class _Man:
             for src in self.macros[name]:
                 self.expanded += 1
                 line = re.sub(r"\\\\?\$([1-9*@])", arg, src).replace("\\\\", "\\")
+                self.expanded_chars += len(line)  # lines are counted above, but one line can be long
+                if self.expanded_chars > MAX_EXPANDED:
+                    self.lost_once("Macros that call themselves too deeply were stopped")
+                    break
                 if line[:1] in (".", "'"):
                     self.control(line, it, depth + 1)
                 elif self.nofill is not None:
@@ -392,7 +400,7 @@ class _Man:
             if not args:
                 self.next_font = {"B": "B", "I": "I", "SB": "B", "SM": "R"}.get(name)
                 return
-            self.text_line(_font_macro(name, args), keep_font=True)
+            self.text_line(_font_macro(name, args))
             return
         if name == "ft":
             self.font = _FONT_NAMES.get(args[0] if args else "R", "R") if args and args[0] != "P" else self.prev_font
@@ -432,7 +440,14 @@ class _Man:
                 value = rest[len(rest) - len(rest.lstrip()):].strip()
                 value = value[len(args[0]):].lstrip()
                 value = value.removeprefix('"')
-                self.strings[args[0]] = (self.strings.get(args[0], "") if name == "as" else "") + value
+                # as groff does, the strings it uses are put in now: a use then never expands again, so
+                # strings made of strings can't multiply (a 300-byte page used to grow past 20 s of work)
+                value = _STRING_REF.sub(lambda m: self.strings.get(m.group(1) or m.group(2) or m.group(3), ""), value)
+                value = (self.strings.get(args[0], "") if name == "as" else "") + value
+                if len(value) > MAX_STRING:
+                    self.lost_once("Strings longer than bookport keeps were cut short")
+                    value = value[:MAX_STRING]
+                self.strings[args[0]] = value
             return
         if name in ("SY", "OP", "YS", "SYNOPSIS"):
             if name == "SY":
@@ -513,7 +528,7 @@ class _Man:
         self.blocks[-1][1].append(html_)
 
     # --- text -------------------------------------------------------------------------------------
-    def text_line(self, line: str, keep_font: bool = False, joined: bool = False) -> None:
+    def text_line(self, line: str, joined: bool = False) -> None:
         if self.next_font:
             line = f"\\f{_font_esc(self.next_font)}{line}\\fR"
             self.next_font = None
@@ -560,12 +575,16 @@ class _Man:
                 name = m.group(6) or m.group(7) or m.group(8) or ""
                 value = self.strings.get(name.split()[0] if name else "", "")
                 if value:
+                    self.expanded_chars += len(value)
+                    if self.expanded_chars > MAX_EXPANDED:
+                        self.lost_once("Strings and macros that grow without end were stopped")
+                        continue
                     out.extend(self.pieces(value) if "\\" in value and len(value) < 1000 else [("t", self.font, value)])
                 continue
             if s[1] in "nN":
                 if s[1] == "N":
                     code = m.group(11) or ""
-                    if code.isdigit() and int(code) < 0x110000:
+                    if code.isdecimal() and int(code) < 0x110000:
                         out.append(("t", self.font, chr(int(code))))
                 continue
             c = m.group(13)
@@ -728,7 +747,9 @@ class _Man:
             # a text block with paragraphs or a listing in it: read it as a little page
             sub = _Man(self.base / "cell")
             sub.top, sub.strings, sub.macros, sub.lost, sub.depth = self.top, self.strings, self.macros, self.lost, self.depth + 1
+            sub.expanded, sub.expanded_chars = self.expanded, self.expanded_chars  # one budget for the page
             inner = sub.read(text)
+            self.expanded, self.expanded_chars = sub.expanded, sub.expanded_chars
             if inner.startswith("<p>") and inner.endswith("</p>") and inner.count("<p>") == 1:
                 inner = inner[3:-4]
             return inner
@@ -1038,7 +1059,9 @@ class _Writer(TextWriter):
                     fmt[col] = "^"
                 col += 1
             fmt_rows.append(" ".join(fmt))
-            data_rows.append("\t".join(cell for cell, f in zip(cells, fmt, strict=True) if f not in ("s",)))
+            # an (empty) entry for spanned columns too: entries go by column, so leaving them out moved
+            # the next cell into the span ("A" spanning two, then "B": B was lost)
+            data_rows.append("\t".join(cells))
         out = [".PP", ".TS", "allbox;"]
         out += [f + ("." if k == len(fmt_rows) - 1 else "") for k, f in enumerate(fmt_rows)]
         out += data_rows

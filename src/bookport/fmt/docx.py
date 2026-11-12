@@ -111,8 +111,9 @@ class _Styles:
                 return min(int(m.group(2)), 6)
             if name in ("title",):
                 return 1
-            if s["outline"] is not None and s["outline"].isdigit() and int(s["outline"]) < 9:
-                return min(int(s["outline"]) + 1, 6)
+            lvl = markup.whole(s["outline"])
+            if lvl is not None and lvl < 9:
+                return min(lvl + 1, 6)
         return 0
 
     def kind(self, sid) -> str:
@@ -143,8 +144,9 @@ class _Numbering:
             self.nums[n.get(w("numId"))] = _wval(n, "abstractNumId")
             for o in n.findall(w("lvlOverride")):
                 start = _wval(o, "startOverride")
-                if start and o.get(w("ilvl"), "0").isdigit():
-                    self.starts[(n.get(w("numId")), int(o.get(w("ilvl"), "0")))] = start
+                ilvl = markup.whole(o.get(w("ilvl"), "0"))
+                if start and ilvl is not None:
+                    self.starts[(n.get(w("numId")), ilvl)] = start
 
     def kind(self, num_id, level) -> tuple[str, int]:
         levels = self.abstract.get(self.nums.get(num_id), {})
@@ -278,12 +280,44 @@ def _core(z) -> Metadata:
     kw = t(CP, "keywords")
     if kw:
         md.subjects += [k.strip() for k in re.split(r"[,;]", kw) if k.strip()]
+    md.subjects = list(dict.fromkeys(md.subjects))  # the subject is usually among the keywords too
     md.language = t(DC, "language")
     md.date = t(DCTERMS, "created")[:10]
     ident = t(DC, "identifier")
     if ident:
         md.identifiers["id"] = ident
+    custom = _xml(z, "docProps/custom.xml")  # what core.xml has no place for: publisher, ISBN, series
+    if custom is not None:
+        props = {}
+        for prop in custom:
+            value = next((" ".join((v.text or "").split()) for v in prop), "")
+            if prop.get("name") and value:
+                props[prop.get("name")] = value
+        md.publisher = props.get("Publisher", "")
+        if props.get("ISBN"):
+            md.identifiers["isbn"] = props["ISBN"]
+        md.series = props.get("Series", "")
+        try:
+            md.series_index = float(props["Series index"]) if props.get("Series index") else None
+        except ValueError:
+            pass
     return md
+
+
+CUSTOM_FMTID = "{D5CDD505-2E9C-101B-9397-08002B2CF9AE}"  # the property set Office uses for custom properties
+
+
+def _custom_props(md) -> str:
+    """docProps/custom.xml for the metadata core.xml can't hold, or "" when there is none."""
+    props = [("Publisher", md.publisher), ("ISBN", md.identifiers.get("isbn", "")), ("Series", md.series),
+             ("Series index", f"{md.series_index:g}" if md.series and md.series_index is not None else "")]
+    body = "".join(f'<property fmtid="{CUSTOM_FMTID}" pid="{pid}" name="{name}"><vt:lpwstr>{markup._esc_text(value)}</vt:lpwstr>'
+                   "</property>" for pid, (name, value) in enumerate(((n, v) for n, v in props if v), 2))
+    if not body:
+        return ""
+    return ('<?xml version="1.0" encoding="UTF-8" standalone="yes"?>\n<Properties xmlns="http://schemas.openxmlformats.org/'
+            'officeDocument/2006/custom-properties" xmlns:vt="http://schemas.openxmlformats.org/officeDocument/2006/'
+            f'docPropsVTypes">{body}</Properties>')
 
 
 class _Converter:
@@ -333,7 +367,8 @@ class _Converter:
             for c in el:
                 self.block(c, parent)
         elif tag == f"{{{MC}}}AlternateContent":
-            choice = el.find(f"{{{MC}}}Fallback") or el.find(f"{{{MC}}}Choice")
+            fallback = el.find(f"{{{MC}}}Fallback")  # (an element's truth is its child count, and warned about)
+            choice = fallback if fallback is not None and len(fallback) else el.find(f"{{{MC}}}Choice")
             if choice is not None:
                 for c in choice:
                     self.block(c, parent)
@@ -343,8 +378,9 @@ class _Converter:
         sid = _wval(ppr, "pStyle") or self.styles.default_para
         level = self.styles.heading(sid)
         outline = _wval(ppr, "outlineLvl")
-        if not level and outline and outline.isdigit() and int(outline) < 6:
-            level = int(outline) + 1
+        outline_n = markup.whole(outline)
+        if not level and outline_n is not None and outline_n < 6:
+            level = outline_n + 1
         kind = self.styles.kind(sid)
         num = ppr.find(w("numPr")) if ppr is not None else None
         page_break = ppr is not None and _on(ppr, "pageBreakBefore")
@@ -382,12 +418,12 @@ class _Converter:
             left = ind.get(w("left")) or ind.get(w("start"))
             first = ind.get(w("firstLine"))
             hang = ind.get(w("hanging"))
-            if left and left.lstrip("-").isdigit() and int(left) > 0:
-                style.append(f"margin-left: {int(left) / 20:g}pt")
-            if first and first.isdigit() and int(first) > 0:
-                style.append(f"text-indent: {int(first) / 20:g}pt")
-            elif hang and hang.isdigit() and int(hang) > 0:
-                style.append(f"text-indent: -{int(hang) / 20:g}pt")
+            if (markup.whole(left) or 0) > 0:
+                style.append(f"margin-left: {markup.whole(left) / 20:g}pt")
+            if (markup.whole(first) or 0) > 0:
+                style.append(f"text-indent: {markup.whole(first) / 20:g}pt")
+            elif (markup.whole(hang) or 0) > 0:
+                style.append(f"text-indent: -{markup.whole(hang) / 20:g}pt")
         if style:
             el.set("style", "; ".join(style))
         self.runs(p, el, sid)
@@ -479,8 +515,8 @@ class _Converter:
                     continue  # continuation of a vertically merged cell
                 cell = ET.SubElement(row, "td")
                 span = _wval(tcpr, "gridSpan")
-                if span and span.isdigit() and int(span) > 1:
-                    cell.set("colspan", span)
+                if (markup.whole(span) or 0) > 1:
+                    cell.set("colspan", str(markup.whole(span)))
                 saved = self.list_stack
                 self.list_stack = []
                 for c in tc:
@@ -803,14 +839,14 @@ class _DocxWriter:
         res = self.book.resources.get(href)
         if res is None or not res.is_image:
             return None
-        data, mt = res.data, res.media_type
-        if mt not in ("image/jpeg", "image/png", "image/gif"):
-            from ..images import to_png
-            png = to_png(data)
-            if png is None:
-                return None
-            data, mt = png, "image/png"
-        if href not in self.media:
+        if href not in self.media:  # converted once, however often the picture is used
+            data, mt = res.data, res.media_type
+            if mt not in ("image/jpeg", "image/png", "image/gif"):
+                from ..images import to_png
+                png = to_png(data)
+                if png is None:
+                    return None
+                data, mt = png, "image/png"
             ext = {"image/jpeg": ".jpeg", "image/png": ".png", "image/gif": ".gif"}[mt]
             name = f"media/image{len(self.media) + 1}{ext}"
             rid = self.rel("http://schemas.openxmlformats.org/officeDocument/2006/relationships/image", name)
@@ -1293,6 +1329,8 @@ def write(book: Book, path, **_) -> None:
         for rid, kind, target, ext in rels)
     import datetime
     now = datetime.datetime.now(datetime.timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
+    created = md.date if re.fullmatch(r"\d{4}(-\d\d(-\d\d)?)?", md.date or "") else now  # the book's own date
+    custom = _custom_props(md)
     core = (f'<?xml version="1.0" encoding="UTF-8" standalone="yes"?>\n<cp:coreProperties xmlns:cp="{CP}" xmlns:dc="{DC}" '
             f'xmlns:dcterms="{DCTERMS}" xmlns:xsi="http://www.w3.org/2001/XMLSchema-instance">'
             f"<dc:title>{markup._esc_text(md.title)}</dc:title><dc:creator>{markup._esc_text('; '.join(md.authors))}</dc:creator>"
@@ -1301,7 +1339,7 @@ def write(book: Book, path, **_) -> None:
             + (f"<dc:description>{markup._esc_text(re.sub(r'<[^>]+>', '', md.description))}</dc:description>" if md.description else "")
             + f"<dc:language>{_esc(lang)}</dc:language>"
             + (f"<dc:identifier>{markup._esc_text(md.uid())}</dc:identifier>")
-            + f'<dcterms:created xsi:type="dcterms:W3CDTF">{now}</dcterms:created>'
+            + f'<dcterms:created xsi:type="dcterms:W3CDTF">{created}</dcterms:created>'
             + f'<dcterms:modified xsi:type="dcterms:W3CDTF">{now}</dcterms:modified></cp:coreProperties>')
     app = ('<?xml version="1.0" encoding="UTF-8" standalone="yes"?>\n<Properties xmlns="http://schemas.openxmlformats.org/'
            'officeDocument/2006/extended-properties"><Application>bookport</Application></Properties>')
@@ -1325,19 +1363,26 @@ def write(book: Book, path, **_) -> None:
                  'wordprocessingml.numbering+xml"/>' if numbering else "")
               + ('<Override PartName="/word/footnotes.xml" ContentType="application/vnd.openxmlformats-officedocument.'
                  'wordprocessingml.footnotes+xml"/>' if footnotes else "")
+              + ('<Override PartName="/docProps/custom.xml" ContentType="application/vnd.openxmlformats-officedocument.'
+                 'custom-properties+xml"/>' if custom else "")
               + "</Types>")
     root_rels = ('<?xml version="1.0" encoding="UTF-8" standalone="yes"?>\n<Relationships xmlns="' + REL + '">'
                  '<Relationship Id="rId1" Type="http://schemas.openxmlformats.org/officeDocument/2006/relationships/'
                  'officeDocument" Target="word/document.xml"/><Relationship Id="rId2" Type="http://schemas.openxmlformats.'
                  'org/package/2006/relationships/metadata/core-properties" Target="docProps/core.xml"/><Relationship '
                  'Id="rId3" Type="http://schemas.openxmlformats.org/officeDocument/2006/relationships/extended-properties" '
-                 'Target="docProps/app.xml"/></Relationships>')
+                 'Target="docProps/app.xml"/>'
+                 + ('<Relationship Id="rId4" Type="http://schemas.openxmlformats.org/officeDocument/2006/relationships/'
+                    'custom-properties" Target="docProps/custom.xml"/>' if custom else "")
+                 + '</Relationships>')
     buf = io.BytesIO()
     with zipfile.ZipFile(buf, "w", zipfile.ZIP_DEFLATED) as z:
         z.writestr("[Content_Types].xml", ctypes)
         z.writestr("_rels/.rels", root_rels)
         z.writestr("docProps/core.xml", core)
         z.writestr("docProps/app.xml", app)
+        if custom:
+            z.writestr("docProps/custom.xml", custom)
         z.writestr("word/document.xml", document)
         z.writestr("word/styles.xml", styles)
         z.writestr("word/settings.xml", settings)

@@ -88,10 +88,6 @@ class Jb2:
     def blit_count(self) -> int:
         return len(self.blits)
 
-    @property
-    def shape_count(self) -> int:
-        return len(self.shapes)
-
     def mask(self, which: list[int] | None = None) -> bytes:
         """The placements (all, or those listed by number) as packed rows, top first, 1 = black."""
         blits = self.blits if which is None else [self.blits[i] for i in which if i < len(self.blits)]

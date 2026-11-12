@@ -118,8 +118,10 @@ class Lit:
         if n in self._sections:
             return self._sections[n]
         name = self.section_names[n] if n < len(self.section_names) else ""
-        if name != "MSCompressed":
+        if name.startswith("EbEncrypt"):  # EbEncryptDS, EbEncryptOnlyDS
             raise DRMError("LIT", "its content is encrypted (Microsoft Reader DRM)")
+        if name != "MSCompressed":
+            raise BookportError(f"Damaged LIT file: no section {n}" if not name else f"Damaged LIT file: unknown section {name}")
         base = f"::DataSpace/Storage/{name}"
         content = self.raw(f"{base}/Content")
         control = self.raw(f"{base}/ControlData")
@@ -160,7 +162,10 @@ class Lit:
 
 def tokens(data: bytes):
     """('open', flags, tag, [(attr, value)]), ('close', flags) and ('text', str) from tokenized XML."""
-    text = data.decode("utf-8", "surrogatepass")
+    try:
+        text = data.decode("utf-8", "surrogatepass")
+    except UnicodeDecodeError:  # one stray byte shouldn't lose the whole book
+        text = data.decode("utf-8", "replace")
     i, n = 0, len(text)
     buf: list[str] = []
     while i < n:
@@ -271,7 +276,7 @@ def read(path) -> Book:
             md.series = content
         elif name.endswith("}series_index"):
             try:
-                md.series_index = float(content) if "." in content else float(content) + 0
+                md.series_index = float(content)
             except ValueError:
                 pass
     # manifest: documents are /data/<id>/content, everything else /data/<id>
@@ -280,10 +285,15 @@ def read(path) -> Book:
         iid, href, mt = e.get("id", ""), e.get("href", "").lstrip("\x02"), e.get("media-type", "")
         items[iid] = (href or iid, mt)
     hrefs: dict[str, str] = {}
+    pages: set[str] = set()  # a/index.htm and b/index.htm both become text/index...: give each its own name
     for iid, (href, mt) in items.items():
         if "oeb1-document" in mt or mt in ("application/xhtml+xml", "text/html"):
-            ext = ".xhtml"
-            hrefs[iid] = "text/" + re.sub(r"[^\w.-]", "_", posixpath.splitext(posixpath.basename(href))[0] or iid) + ext
+            base = "text/" + re.sub(r"[^\w.-]", "_", posixpath.splitext(posixpath.basename(href))[0] or iid)
+            name, k = base + ".xhtml", 1
+            while name in pages:
+                name, k = f"{base}_{k}.xhtml", k + 1
+            pages.add(name)
+            hrefs[iid] = name
         elif "css" in mt:
             hrefs[iid] = "styles/" + re.sub(r"[^\w.-]", "_", iid) + ".css"
         else:

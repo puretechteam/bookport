@@ -55,17 +55,35 @@ class Rule:
     order: int
 
 
-_COMMENT = re.compile(r"/\*.*?\*/", re.DOTALL)
+MAX_NEST = 20  # @media and @supports blocks inside each other; deeper ones are left out
+
+
+def _strip_comments(text: str) -> str:
+    # a scan, not /\*.*?\*/: with many unclosed "/*" that regex looked to the end from each of them
+    if "/*" not in text:
+        return text
+    out, i = [], 0
+    while True:
+        j = text.find("/*", i)
+        if j < 0:
+            out.append(text[i:])
+            break
+        out.append(text[i:j])
+        k = text.find("*/", j + 2)
+        if k < 0:
+            break  # an unclosed comment runs to the end
+        i = k + 2
+    return "".join(out)
 
 
 def parse_stylesheet(text: str, start_order: int = 0) -> list[Rule]:
-    text = _COMMENT.sub("", text)
+    text = _strip_comments(text)
     rules: list[Rule] = []
     _parse_block(text, rules, start_order)
     return rules
 
 
-def _parse_block(text, rules, order):
+def _parse_block(text, rules, order, depth=0):
     i, n = 0, len(text)
     while i < n:
         j = text.find("{", i)
@@ -76,23 +94,24 @@ def _parse_block(text, rules, order):
         body = text[j + 1:end]
         i = end + 1
         if prelude.startswith("@"):
-            # an @-rule ending with ';' before the '{' (e.g. @import) belongs to the prelude
+            # an @-rule ending with ';' before the '{' (@charset, @import) belongs to the prelude: what
+            # follows its ';' is the next rule's selector
             semi = prelude.rfind(";")
             if semi >= 0:
                 prelude = prelude[semi + 1:].strip()
-            if not prelude.startswith("@"):
-                pass
-            else:
-                kw = re.match(r"@[-\w]*", prelude).group(0).lower()  # "@supports(...)" has no space
-                if kw == "@media":
-                    media = prelude[6:].lower()
-                    if not media.strip() or any(m in media for m in ("screen", "all")) and "amzn-mobi" not in media:
-                        order = _parse_block(body, rules, order)
-                elif kw == "@supports":
-                    # every condition is taken as supported, except negated ones
-                    if not re.match(r"@supports\s*not\b", prelude, re.IGNORECASE):
-                        order = _parse_block(body, rules, order)
+        if prelude.startswith("@"):
+            kw = re.match(r"@[-\w]*", prelude).group(0).lower()  # "@supports(...)" has no space
+            if depth >= MAX_NEST:
                 continue
+            if kw == "@media":
+                media = prelude[6:].lower()
+                if not media.strip() or any(m in media for m in ("screen", "all")) and "amzn-mobi" not in media:
+                    order = _parse_block(body, rules, order, depth + 1)
+            elif kw == "@supports":
+                # every condition is taken as supported, except negated ones
+                if not re.match(r"@supports\s*not\b", prelude, re.IGNORECASE):
+                    order = _parse_block(body, rules, order, depth + 1)
+            continue
         if "@" in prelude and ";" in prelude:
             prelude = prelude[prelude.rfind(";") + 1:].strip()
         decls = parse_declarations(body)
@@ -261,8 +280,7 @@ _SIMPLE = re.compile(
 
 def parse_selector(sel: str):
     """Returns ([(combinator, compound), ...], specificity) or None if unsupported."""
-    sel = sel.strip()
-    tokens = re.split(r"\s*([>+~])\s*|\s+", sel)
+    tokens = _selector_tokens(sel.strip())
     chain = []
     comb = " "
     a = b = c = 0
@@ -289,7 +307,49 @@ def parse_selector(sel: str):
     return chain, (a, b, c)
 
 
+def _selector_tokens(sel: str) -> list[str]:
+    """Compound selectors and the combinators between them; a "+", "~" or space inside (...), [...] or
+    quotes (``:nth-child(2n+1)``, ``[class~=x]``) belongs to its compound."""
+    tokens: list[str] = []
+    cur: list[str] = []
+    depth, quote = 0, ""
+    for ch in sel:
+        if quote:
+            quote = "" if ch == quote else quote
+        elif ch in "\"'":
+            quote = ch
+        elif ch in "([":
+            depth += 1
+        elif ch in ")]":
+            depth = max(0, depth - 1)
+        elif depth == 0 and (ch.isspace() or ch in ">+~"):
+            if cur:
+                tokens.append("".join(cur))
+                cur = []
+            if ch in ">+~":
+                tokens.append(ch)
+            continue
+        cur.append(ch)
+    if cur:
+        tokens.append("".join(cur))
+    return tokens
+
+
 _PSEUDO_OK = {"first-child", "last-child", "only-child", "first-of-type", "last-of-type", "link", "root", "empty"}
+_NTH = re.compile(r"([+-]?\d*)n([+-]\d+)?|([+-]?\d+)", re.ASCII)
+
+
+def _nth_ab(arg: str):
+    """``an+b`` of :nth-child() as (a, b), or None when it isn't one (the rule is then left out, as CSS says)."""
+    expr = arg.replace(" ", "").lower()
+    expr = {"odd": "2n+1", "even": "2n"}.get(expr, expr)
+    m = _NTH.fullmatch(expr)
+    if not m or len(expr) > 20:
+        return None
+    if m.group(3) is not None:
+        return 0, int(m.group(3))
+    a = m.group(1)
+    return (-1 if a == "-" else 1 if a in ("", "+") else int(a)), int(m.group(2) or 0)
 
 
 def _parse_compound(tok):
@@ -298,8 +358,8 @@ def _parse_compound(tok):
     while pos < len(tok):
         if tok.startswith(":not(", pos):
             end = tok.find(")", pos)
-            inner = _parse_compound(tok[pos + 5:end])
-            if inner is None or end < 0:
+            inner = _parse_compound(tok[pos + 5:end]) if end >= 0 and ":not(" not in tok[pos + 5:end] else None
+            if inner is None:  # unclosed, or :not() inside :not(), which CSS doesn't allow
                 return None
             out.append(("not", inner))
             pos = end + 1
@@ -327,7 +387,10 @@ def _parse_compound(tok):
                           "focus", "active", "visited", "target"):
                 return None  # generated content and dynamic states don't apply to a static book
             if pseudo == "nth-child" or pseudo == "nth-of-type":
-                out.append(("nth", pseudo, (m.group("arg") or "").strip()))
+                ab = _nth_ab(m.group("arg") or "")
+                if ab is None:
+                    return None
+                out.append(("nth", pseudo, ab))
             elif pseudo in _PSEUDO_OK:
                 out.append(("pseudo", pseudo))
             else:
@@ -335,20 +398,8 @@ def _parse_compound(tok):
     return out
 
 
-def _nth_match(expr, index):
-    expr = expr.replace(" ", "").lower()
-    if expr == "odd":
-        expr = "2n+1"
-    elif expr == "even":
-        expr = "2n"
-    if "n" not in expr:
-        try:
-            return index == int(expr)
-        except ValueError:
-            return False
-    a, _, b = expr.partition("n")
-    a = -1 if a == "-" else (1 if a in ("", "+") else int(a))
-    b = int(b) if b else 0
+def _nth_match(ab, index):
+    a, b = ab
     if a == 0:
         return index == b
     return (index - b) % a == 0 and (index - b) // a >= 0
@@ -360,13 +411,23 @@ class Matcher:
     def __init__(self, root: ET.Element):
         self.parent = {c: p for p in root.iter() for c in p}
         self.root = root
+        self._sibs: dict = {}  # (parent, tag or None) -> (its element children, {child: index})
+        self._memo: dict = {}  # (rule chain, step, element) -> matched: each ancestor is tried once per step
 
     def classes(self, el):
         return el.get("class", "").split()
 
-    def _siblings(self, el):
+    def _siblings(self, el, of_type=False):
+        """(el and its element siblings, el's index among them), listed once per parent, not once per element."""
         p = self.parent.get(el)
-        return [c for c in p if isinstance(c.tag, str)] if p is not None else [el]
+        if p is None:
+            return [el], 0
+        key = (p, el.tag if of_type else None)
+        got = self._sibs.get(key)
+        if got is None:
+            sibs = [c for c in p if isinstance(c.tag, str) and (not of_type or c.tag == el.tag)]
+            got = self._sibs[key] = (sibs, {c: k for k, c in enumerate(sibs)})
+        return got[0], got[1][el]
 
     def compound(self, el, compound) -> bool:
         for item in compound:
@@ -409,20 +470,16 @@ class Matcher:
                     if len(el) or el.text:
                         return False
                 else:
-                    sibs = self._siblings(el)
-                    if name.endswith("of-type"):
-                        sibs = [s for s in sibs if s.tag == el.tag]
-                    if name.startswith("first") and sibs[0] is not el:
+                    sibs, k = self._siblings(el, name.endswith("of-type"))
+                    if name.startswith("first") and k != 0:
                         return False
-                    if name.startswith("last") and sibs[-1] is not el:
+                    if name.startswith("last") and k != len(sibs) - 1:
                         return False
                     if name == "only-child" and len(sibs) != 1:
                         return False
             elif kind == "nth":
-                sibs = self._siblings(el)
-                if item[1] == "nth-of-type":
-                    sibs = [s for s in sibs if s.tag == el.tag]
-                if not _nth_match(item[2], sibs.index(el) + 1):
+                _sibs, k = self._siblings(el, item[1] == "nth-of-type")
+                if not _nth_match(item[2], k + 1):
                     return False
             elif kind == "not" and self.compound(el, item[1]):
                 return False
@@ -436,6 +493,13 @@ class Matcher:
     def _match_from(self, el, chain, i):
         if i == 0:
             return True
+        key = (id(chain), i, el)
+        got = self._memo.get(key)
+        if got is None:
+            got = self._memo[key] = self._match_step(el, chain, i)
+        return got
+
+    def _match_step(self, el, chain, i):
         comb = chain[i][0]
         target = chain[i - 1][1]
         if comb == " ":
@@ -448,8 +512,7 @@ class Matcher:
         if comb == ">":
             p = self.parent.get(el)
             return p is not None and self.compound(p, target) and self._match_from(p, chain, i - 1)
-        sibs = self._siblings(el)
-        k = sibs.index(el)
+        sibs, k = self._siblings(el)
         if comb == "+":
             return k > 0 and self.compound(sibs[k - 1], target) and self._match_from(sibs[k - 1], chain, i - 1)
         for s in sibs[:k]:
@@ -611,7 +674,7 @@ def font_size(value: str | None, parent: float, root: float = 12.0) -> float:
 
 def is_bold(style) -> bool:
     w = style.get("font-weight", "normal").lower()
-    return w in ("bold", "bolder") or (w.isdigit() and int(w) >= 600)
+    return w in ("bold", "bolder") or (w.isascii() and w.isdigit() and len(w) < 5 and int(w) >= 600)
 
 
 def is_italic(style) -> bool:

@@ -77,6 +77,8 @@ FORMATS: dict[str, tuple[str, str, bool, bool]] = {
     "png": ("comic", "PNG image (one page)", True, False),
     "gif": ("comic", "GIF image (one page)", True, False),
     "webp": ("comic", "WebP image (one page)", True, False),
+    "ps": ("postscript", "PostScript", True, False),
+    "eps": ("postscript", "Encapsulated PostScript (EPS)", True, False),
 }
 
 
@@ -87,6 +89,10 @@ def formats() -> dict[str, dict]:
 
 def _module(name: str):
     return importlib.import_module(f"bookport.fmt.{name}")
+
+
+_MAGIC_COMMENT_EXTS = frozenset({"tex", "ltx", "latex", "sty", "cls", "bib", "txt", "md", "markdown", "rst", "org",
+                                 "adoc", "asciidoc", "typ", "textile", "wiki", "html", "htm", "xml"})
 
 
 def detect(path: str | os.PathLike) -> str:
@@ -105,6 +111,11 @@ def detect(path: str | os.PathLike) -> str:
         return _zip_kind(p, ext)
     if _pdf_header(head):
         return "pdf"
+    if (head[:2] == b"%!" and (head[:4] == b"%!PS" or ext not in _MAGIC_COMMENT_EXTS)) \
+            or head[:4] == b"\xc5\xd0\xd3\xc6" or (head[:9] == b"\x1b%-12345X" and b"%!PS" in head):
+        # PostScript (a DOS EPS binary header, or a printer job around it): a program, never plain text.
+        # (Not a LaTeX or text file whose first line is an editor's magic comment, "%!TEX program = xelatex".)
+        return "eps" if ext in ("eps", "epsf", "epsi") or b"EPSF" in head[:64] else "ps"
     if head[:8] == b"ITOLITLS":
         return "lit"
     if head[:4] == b"ITSF":
@@ -204,10 +215,17 @@ def _zip_kind(p: Path, ext: str) -> str:
 
 
 def _is_kf8_only(p: Path) -> bool:
-    from .fmt import mobi
+    """A Kindle file whose first header is KF8 (version 8): read from its first record only, not the whole
+    file (which read() then read again)."""
     try:
-        return mobi.kind(p.read_bytes()) == "azw3"
-    except Exception:  # noqa: BLE001 - detection never fails on a strange file
+        with p.open("rb") as f:
+            head = f.read(86)  # the PDB header and the first record's place
+            if len(head) < 86:
+                return False
+            f.seek(struct.unpack(">I", head[78:82])[0])
+            r0 = f.read(40)
+        return r0[16:20] == b"MOBI" and struct.unpack(">I", r0[36:40])[0] == 8
+    except (OSError, struct.error):
         return False
 
 
@@ -349,8 +367,11 @@ def write_book(book: Book, path, fmt: str | None = None, **options) -> Path:
     fd, tmp = tempfile.mkstemp(prefix=".bookport-", suffix="." + fmt, dir=path.parent)
     os.close(fd)
     try:
-        module.write(book, tmp, fmt=fmt, **options) if _takes_fmt(module) else module.write(book, tmp, **options)
-        os.chmod(tmp, 0o666 & ~_umask())  # mkstemp makes the file private; give it a new file's usual mode
+        try:
+            module.write(book, tmp, fmt=fmt, **options) if _takes_fmt(module) else module.write(book, tmp, **options)
+        except DAMAGE as e:  # something in the book this format can't hold (a 16-bit field overflowing, say)
+            raise BookportError(f"Can't write this book as {fmt.upper()}: {e}") from e
+        os.chmod(tmp, 0o666 & ~_UMASK)  # mkstemp makes the file private; give it a new file's usual mode
         os.replace(tmp, path)
     except BaseException:
         try:
@@ -365,6 +386,9 @@ def _umask() -> int:
     mask = os.umask(0o022)
     os.umask(mask)
     return mask
+
+
+_UMASK = _umask()  # read once: setting it per write briefly changed it for every thread in the process
 
 
 def write_options(fmt: str) -> set[str]:
@@ -388,6 +412,13 @@ def _takes_fmt(module) -> bool:
 
 
 def convert(src, dst, fmt: str | None = None, **options) -> Path:
-    """Read ``src`` and write it to ``dst`` (format from ``fmt`` or ``dst``'s extension)."""
+    """Read ``src`` and write it to ``dst`` (format from ``fmt`` or ``dst``'s extension).
+
+    PostScript or EPS to PDF, with no options, goes straight through ``bookport.ps.to_pdf``: every page as it was
+    drawn, not reflowed as a book."""
+    target = (fmt or Path(dst).suffix.lstrip(".")).lower()
+    if target == "pdf" and not options and Path(src).is_file() and detect(src) in ("ps", "eps"):
+        from . import ps
+        return Path(ps.to_pdf(src, dst))
     book = read(src)
     return write_book(book, dst, fmt, **options)

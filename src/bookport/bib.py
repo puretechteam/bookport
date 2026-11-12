@@ -284,6 +284,7 @@ class Entry:
 
 
 MAX_BIB = 20 * 1024 * 1024  # characters of .bib read for one book
+MAX_VALUE = 65_536  # characters of one field or @string value
 
 
 class _BibParser:
@@ -332,7 +333,8 @@ class _BibParser:
         return s[start:]
 
     def value(self) -> str:
-        parts = []
+        parts: list[str] = []
+        size = 0
         while True:
             self.ws()
             if self.i >= len(self.s):
@@ -350,6 +352,12 @@ class _BibParser:
                     break
                 low = word.lower()
                 parts.append(word if word.isdigit() else self.strings.get(low) or MONTHS.get(low) or word)
+            # bounded as it is built: @string{a = a # a} doubled with every line (24 lines made a
+            # 33-million-character title)
+            size += len(parts[-1])
+            if size > MAX_VALUE:
+                parts[-1] = parts[-1][:max(0, len(parts[-1]) - (size - MAX_VALUE))]
+                size = MAX_VALUE
             self.ws()
             if self.i < len(self.s) and self.s[self.i] == "#":
                 self.i += 1
@@ -669,7 +677,8 @@ def render(e: Entry, year_suffix: str = "") -> list[tuple[str, str]]:
         num = e.get("number") or e.get("issue")
         pages = e.get("pages").replace("--", "–")
         tail = (f" {vol}" if vol else "") + (f" ({num})" if num else "") + (f": {pages}" if pages else "")
-        runs.append((_end(tail) + " " if tail else ". ", ""))
+        # the space after the journal's name: _end strips it ("Nature5 (2)")
+        runs.append(((" " if not tail.startswith(":") else "") + _end(tail) + " " if tail else ". ", ""))
     elif e.get("booktitle"):
         runs.append(("In ", ""))
         runs.append((e.get("booktitle"), "em"))

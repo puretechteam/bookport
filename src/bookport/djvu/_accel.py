@@ -9,7 +9,7 @@ from __future__ import annotations
 
 import os
 
-VERSION = "0.3.0"  # the bookport-native this bookport is made for
+VERSION = "0.4.0"  # the bookport-native this bookport is made for
 
 native = None
 if not os.environ.get("BOOKPORT_PURE"):

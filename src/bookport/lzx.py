@@ -154,10 +154,8 @@ class LzxDecoder:
         self.length_lengths = [0] * LENGTH_SIZE
         self.header_read = False
         self.e8_size = 0
-        self.frames = 0
         self.block_left = 0
         self.block_type = 0
-        self.intel_started = False
         self._uncompressed_odd = False
 
     def _read_lengths(self, bits: _Bits, lengths: list[int], first: int, last: int):
@@ -257,7 +255,6 @@ class LzxDecoder:
             # each frame ends on a 16-bit boundary in the input
             if self.block_type != 3:
                 bits.align()
-            self.frames += 1
         self.history = bytes(hist[-self.window_size:])
         out = hist[base:]
         if self.e8_size:
@@ -400,7 +397,6 @@ class LzxDecoder:
 def compress_stored(data: bytes) -> bytes:
     """LZX made of uncompressed blocks only (no E8 translation): what a LIT writer can always use."""
     out = bytearray()
-    bits = []  # (value, width) pending before the first byte-aligned block
 
     def flush_bits(pairs):
         buf = 0
@@ -435,5 +431,4 @@ def compress_stored(data: bytes) -> bytes:
         pos += len(chunk)
         if not chunk:
             break
-    del bits
     return bytes(out)

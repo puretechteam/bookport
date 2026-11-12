@@ -600,12 +600,33 @@ fn or_row(dst: &mut [u8], src: &[u8], sw: usize, left: i64, w: usize) {
             dst[at as usize] |= b >> shift;
         }
         if shift != 0 && (0..n).contains(&(at + 1)) {
-            dst[at as usize + 1] |= ((b as u32) << (8 - shift)) as u8;
+            dst[(at + 1) as usize] |= ((b as u32) << (8 - shift)) as u8; // at can be -1: add before the cast
         }
     }
     // no bits past the page's last column
     if w % 8 != 0 && n > 0 {
         let last = dst.len() - 1;
         dst[last] &= !(0xFFu8 >> (w % 8));
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::or_row;
+
+    #[test]
+    fn a_shape_starting_left_of_the_page_is_clipped() {
+        // 8 black pixels from column -3: columns 0 to 4 show (the byte before the page wrapped usize, a panic in
+        // a debug build)
+        let mut dst = [0u8; 2];
+        or_row(&mut dst, &[0xFF], 8, -3, 16);
+        assert_eq!(dst, [0xF8, 0x00]);
+    }
+
+    #[test]
+    fn a_shape_across_a_byte_boundary() {
+        let mut dst = [0u8; 3];
+        or_row(&mut dst, &[0xFF, 0x80], 9, 5, 20);
+        assert_eq!(dst, [0x07, 0xFC, 0x00]);
     }
 }

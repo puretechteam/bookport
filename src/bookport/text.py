@@ -70,7 +70,3 @@ def book_text(book) -> str:
     for href, _res in book.documents():
         out.extend(document_paragraphs(book.tree(href)))
     return _INVISIBLE.sub("", "\n\n".join(out))
-
-
-def words(text: str) -> list[str]:
-    return re.findall(r"\w+", text.lower())

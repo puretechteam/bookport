@@ -3,7 +3,10 @@ object streams, incremental updates, damaged-file repair, filters and decryption
 
 from __future__ import annotations
 
+import io
+import itertools
 import re
+import zlib
 
 from .. import limits
 from ..errors import BookportError
@@ -283,8 +286,14 @@ def _predict(data: bytes, parms: dict) -> bytes:
             for i in range(r + bpp, min(r + row, len(out))):
                 out[i] = (out[i] + out[i - bpp]) & 0xFF
         return bytes(out)
+    if bpc == 8 and colors <= 4 and len(data) >= 1 << 16:
+        got = _png_rows(data, colors, cols, row)
+        if got is not None:
+            return got
     out = bytearray()
     prev = bytearray(row)
+    hi = int.from_bytes(b"\x80" * row, "big")  # for Up: bytewise sums of two rows as one big-integer addition
+    lo = hi ^ ((1 << (8 * row)) - 1)
     pos = 0
     while pos + 1 + row <= len(data) or pos + 1 < len(data):
         ft = data[pos]
@@ -292,11 +301,11 @@ def _predict(data: bytes, parms: dict) -> bytes:
         line += bytes(row - len(line))
         pos += 1 + row
         if ft == 1:
-            for i in range(bpp, row):
-                line[i] = (line[i] + line[i - bpp]) & 0xFF
+            for k in range(bpp):  # each byte plus the one bpp before it: running sums, one per byte of a pixel
+                line[k::bpp] = bytes(map(_BYTE, itertools.accumulate(line[k::bpp])))
         elif ft == 2:
-            for i in range(row):
-                line[i] = (line[i] + prev[i]) & 0xFF
+            x, y = int.from_bytes(line, "big"), int.from_bytes(prev, "big")
+            line = bytearray((((x & lo) + (y & lo)) ^ ((x ^ y) & hi)).to_bytes(row, "big"))
         elif ft == 3:
             for i in range(row):
                 line[i] = (line[i] + (((line[i - bpp] if i >= bpp else 0) + prev[i]) >> 1)) & 0xFF
@@ -311,6 +320,44 @@ def _predict(data: bytes, parms: dict) -> bytes:
         out += line
         prev = line
     return bytes(out)
+
+
+_BYTE = (255).__and__
+
+
+def _png_rows(data: bytes, colors: int, cols: int, row: int) -> bytes | None:
+    """PNG-predicted rows (8 bits a sample) undone by Pillow, in C (about 25 times faster than the loop in
+    _predict); None without Pillow, or for rows it won't take (a filter type past 4)."""
+    try:
+        import warnings
+
+        from PIL import Image
+    except ImportError:
+        return None
+    rows, left = divmod(len(data), row + 1)
+    if left > 1:  # a short last row is read as if the rest were zeros, as _predict reads it
+        data = data + bytes(row + 1 - left)
+        rows += 1
+    elif left:
+        data = data[:-1]
+    if not rows:
+        return None
+    mode, kind = {1: ("L", 0), 2: ("LA", 4), 3: ("RGB", 2), 4: ("RGBA", 6)}[colors]
+
+    def chunk(tag: bytes, body: bytes) -> bytes:
+        return len(body).to_bytes(4, "big") + tag + body + zlib.crc32(tag + body).to_bytes(4, "big")
+    png = (b"\x89PNG\r\n\x1a\n" + chunk(b"IHDR", cols.to_bytes(4, "big") + rows.to_bytes(4, "big") + bytes((8, kind, 0, 0, 0)))
+           + chunk(b"IDAT", zlib.compress(data, 0)) + chunk(b"IEND", b""))
+    try:
+        with warnings.catch_warnings():
+            warnings.simplefilter("ignore")  # a big picture is no bomb here: its bytes are already in memory
+            img = Image.open(io.BytesIO(png))
+            img.load()
+        if img.mode != mode:
+            return None
+        return img.tobytes()
+    except (OSError, ValueError, SyntaxError, Image.DecompressionBombError):
+        return None
 
 
 def _lzw(data: bytes, early: int = 1) -> bytes:
@@ -404,6 +451,9 @@ def _rl(data: bytes) -> bytes:
         else:
             out += data[i + 1:i + 2] * (257 - n)
             i += 2
+        if len(out) > limits.MAX_PART:  # up to 64 times its size: held to the limits as LZW and Flate are
+            limits.grow(out)
+    limits.charge(len(out))
     return bytes(out)
 
 
@@ -422,6 +472,7 @@ class Document:
         self.cache: dict[int, object] = {}
         self.crypt = None
         self._objstm_cache: dict[int, list] = {}
+        self._scanned: dict[int, int] | None = None  # object number -> offset, from a scan, made when needed
         try:
             self._read_xref()
         except (BookportError, ValueError, IndexError, KeyError, TypeError):
@@ -557,12 +608,15 @@ class Document:
         self.trailer = trailer
 
     # --- objects ------------------------------------------------------------------------------
-    def _parse_indirect_at(self, pos: int, num: int = 0, gen: int = 0):
+    def _parse_indirect_at(self, pos: int, expect: int | None = None):
+        """The object at pos; with expect, a BookportError unless it's that object (a wrong offset)."""
         data = self.data
         m = re.compile(rb"\s*(\d+)\s+(\d+)\s+obj").match(data, pos)
         if not m:
             raise BookportError("bad object")
         num, gen = int(m.group(1)), int(m.group(2))
+        if expect is not None and num != expect:
+            raise BookportError("bad object")
         value, end = parse_value(data, m.end())
         m2 = re.compile(rb"\s*stream(\r\n|\n|\r)?").match(data, end)
         if m2 and isinstance(value, dict):
@@ -586,7 +640,7 @@ class Document:
         entry = self.xref.get(ref.num)
         if entry and entry[0] == 1:
             try:
-                return self._parse_indirect_at(entry[1])
+                return self._at(entry[1], ref.num)
             except BookportError:
                 return None
         return self.get(ref.num)
@@ -608,7 +662,7 @@ class Document:
         if entry is not None:
             try:
                 if entry[0] == 1:
-                    value = self._parse_indirect_at(entry[1])
+                    value = self._at(entry[1], num)
                 elif entry[0] == 2:
                     value = self._from_objstm(entry[1], entry[2])
             except limits.LimitError:
@@ -619,6 +673,20 @@ class Document:
             value.dict = self._decrypt_strings(value.dict, value.num, value.gen)
         self.cache[num] = value
         return value
+
+    def _at(self, offset: int, num: int):
+        """Object num at offset, or where a scan of the file finds it when the offset is wrong (junk before
+        %PDF, a file edited by hand: every offset off by the same amount)."""
+        try:
+            return self._parse_indirect_at(offset, num)
+        except BookportError:
+            if self._scanned is None:
+                self._scanned = {int(m.group(1)): m.start()
+                                 for m in re.finditer(rb"(?<![\d])(\d+)\s+(\d+)\s+obj\b", self.data)}
+            found = self._scanned.get(num)
+            if found is None or found == offset:
+                raise
+            return self._parse_indirect_at(found, num)
 
     def _from_objstm(self, stm_num: int, index: int):
         objs = self._objstm_cache.get(stm_num)
@@ -667,13 +735,14 @@ class Document:
             parms = [parms] * len(filters)
         for f, p in zip(filters, parms + [None] * (len(filters) - len(parms)) if parms else [None] * len(filters)):
             f = str(self.resolve(f))
-            p = self.resolve(p) or {}
-            if isinstance(p, dict):
-                p = {k: self.resolve(v) for k, v in p.items()}
+            p = self.resolve(p)
+            if isinstance(p, list) and len(p) == 1:  # [<< ... >>] for a single filter
+                p = self.resolve(p[0])
+            p = {k: self.resolve(v) for k, v in p.items()} if isinstance(p, dict) else {}
             if f in ("FlateDecode", "Fl"):
                 data = _predict(_flate(data), p)
             elif f in ("LZWDecode", "LZW"):
-                data = _predict(_lzw(data, p.get("EarlyChange", 1) if isinstance(p, dict) else 1), p)
+                data = _predict(_lzw(data, p.get("EarlyChange", 1)), p)
             elif f in ("ASCII85Decode", "A85"):
                 data = _a85(data)
             elif f in ("ASCIIHexDecode", "AHx"):
@@ -682,10 +751,8 @@ class Document:
                 data = _rl(data)
             elif f == "Crypt":
                 continue
-            elif f in IMAGE_FILTERS:
-                return data
             else:
-                return data
+                return data  # a picture's own filter (DCT, JPX, CCITT, JBIG2), or one this reader doesn't know
         return data
 
     def stream_filters(self, stm: Stream) -> list[str]:
@@ -734,6 +801,34 @@ class Document:
 
         walk(self.root.get("Pages"), {}, 0)
         return out
+
+
+def named_dests(doc: Document, most: int = 100_000) -> dict:
+    """Every named destination: the catalog's Dests dictionary and the Names tree's Dests, name (as str,
+    a PDF string read as Latin-1) -> value."""
+    found: dict = {}
+    root = doc.root
+    old = doc.resolve(root.get("Dests"))
+    if isinstance(old, dict):
+        for k, v in old.items():
+            found[str(k)] = v
+    names = doc.resolve(root.get("Names"))
+    tree = doc.resolve(names.get("Dests")) if isinstance(names, dict) else None
+    stack, seen = [tree], set()
+    while stack and len(found) < most:
+        node = stack.pop()
+        if not isinstance(node, dict) or id(node) in seen:
+            continue
+        seen.add(id(node))
+        pairs = doc.resolve(node.get("Names"))
+        if isinstance(pairs, list):
+            for i in range(0, len(pairs) - 1, 2):
+                key = doc.resolve(pairs[i])
+                found[bytes(key).decode("latin-1") if isinstance(key, bytes) else str(key)] = pairs[i + 1]
+        kids = doc.resolve(node.get("Kids"))
+        if isinstance(kids, list):
+            stack.extend(doc.resolve(k) for k in kids)
+    return found
 
 
 def text_string(v) -> str:

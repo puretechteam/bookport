@@ -13,6 +13,7 @@ outlines and links. The optional bookport-native package decodes many times fast
 
 from __future__ import annotations
 
+import operator
 import os
 import struct
 import zlib
@@ -125,10 +126,31 @@ def to_text(src) -> str:
             import contextvars
             from concurrent.futures import ThreadPoolExecutor
             with ThreadPoolExecutor(n) as pool:
-                texts = list(pool.map(lambda p: contextvars.copy_context().run(one, p), doc.pages))
+                # each page's context copied here, on this thread: copied in a worker, it had no unpacking budget
+                runs = [(contextvars.copy_context(), p) for p in doc.pages]
+                texts = list(pool.map(lambda job: job[0].run(one, job[1]), runs))
         else:
             texts = [one(p) for p in doc.pages]
     return b"".join(t + b"\n\f" for t in texts if t is not None).decode("utf-8", "replace")
+
+
+_BITS = [bytes((b >> (7 - k)) & 1 for k in range(8)) for b in range(256)]  # a packed byte as 8 bytes of 0 or 1
+_DIGIT = bytes.maketrans(b"\x00\x01", b"01")
+
+
+def _unpack(pic: Picture) -> bytes:
+    """A 1-bit picture as one byte (0 or 1) a pixel."""
+    nb = (pic.width + 7) // 8
+    w = pic.width
+    return b"".join(b"".join(_BITS[b] for b in pic.data[y * nb:(y + 1) * nb])[:w] for y in range(pic.height))
+
+
+def _pack(px: bytes, w: int, h: int) -> bytes:
+    """One byte (0 or 1) a pixel back to packed 1-bit rows."""
+    nb = (w + 7) // 8
+    pad = b"0" * (nb * 8 - w)
+    return b"".join(int(px[y * w:(y + 1) * w].translate(_DIGIT) + pad, 2).to_bytes(nb, "big") if nb else b""
+                    for y in range(h))
 
 
 def _scale(pic: Picture, scale: float) -> Picture:
@@ -136,26 +158,32 @@ def _scale(pic: Picture, scale: float) -> Picture:
     w2 = max(1, round(pic.width * scale))
     h2 = max(1, round(pic.height * scale))
     if pic.mode == "1":
-        nb = (pic.width + 7) // 8
-        rows = []
-        for y in range(pic.height):
-            r = pic.data[y * nb:(y + 1) * nb]
-            rows.append(bytes(0 if (r[x >> 3] >> (7 - (x & 7))) & 1 else 255 for x in range(pic.width)))
-        pic = Picture(pic.width, pic.height, "L", b"".join(rows))
+        pic = Picture(pic.width, pic.height, "L", _unpack(pic).translate(bytes([255, 0]) + bytes(254)))
     nc = 3 if pic.mode == "RGB" else 1
+    w = pic.width
+    xs = [(x * w // w2, max(x * w // w2 + 1, (x + 1) * w // w2)) for x in range(w2)]
     out = bytearray(w2 * h2 * nc)
-    xs = [(x * pic.width // w2, max(x * pic.width // w2 + 1, (x + 1) * pic.width // w2)) for x in range(w2)]
+    rows: dict[int, list[list[int]]] = {}  # a source row's sums over each column span, one list a channel
+
+    def sums(yy):
+        got = rows.get(yy)
+        if got is None:
+            line = pic.data[yy * w * nc:(yy + 1) * w * nc]
+            got = rows[yy] = [[sum(plane[x0:x1]) for x0, x1 in xs] for plane in (line[c::nc] for c in range(nc))]
+        return got
+
     for y in range(h2):
         y0 = y * pic.height // h2
         y1 = max(y0 + 1, (y + 1) * pic.height // h2)
-        for x, (x0, x1) in enumerate(xs):
-            n = (y1 - y0) * (x1 - x0)
-            for c in range(nc):
-                s = 0
-                for yy in range(y0, y1):
-                    base = yy * pic.width * nc + c
-                    s += sum(pic.data[base + xx * nc] for xx in range(x0, x1))
-                out[(y * w2 + x) * nc + c] = (s + n // 2) // n
+        for c in range(nc):
+            total = list(sums(y0)[c])
+            for yy in range(y0 + 1, y1):
+                total = list(map(operator.add, total, sums(yy)[c]))
+            span = y1 - y0
+            out[y * w2 * nc + c:(y + 1) * w2 * nc:nc] = bytes(
+                (s + n // 2) // n for s, n in zip(total, ((x1 - x0) * span for x0, x1 in xs)))
+        for yy in [k for k in rows if k < y1 - 1]:
+            del rows[yy]  # rows above are done with
     return Picture(w2, h2, pic.mode, bytes(out))
 
 
@@ -164,24 +192,25 @@ def _rotate(pic: Picture, degrees: int) -> Picture:
     if not degrees:
         return pic
     w, h = pic.width, pic.height
-    if pic.mode == "1":
-        nb = (w + 7) // 8
-        px = [[(pic.data[y * nb + (x >> 3)] >> (7 - (x & 7))) & 1 for x in range(w)] for y in range(h)]
-    else:
-        nc = 3 if pic.mode == "RGB" else 1
-        px = [[pic.data[(y * w + x) * nc:(y * w + x + 1) * nc] for x in range(w)] for y in range(h)]
+    bits = pic.mode == "1"
+    nc = 1 if bits else 3 if pic.mode == "RGB" else 1
+    px = _unpack(pic) if bits else pic.data
+    out = bytearray(len(px))
+    stride = w * nc
     if degrees == 180:
-        out = [row[::-1] for row in px[::-1]]
-    elif degrees == 90:  # counter-clockwise: the right column becomes the top row
-        out = [[px[y][x] for y in range(h)] for x in range(w - 1, -1, -1)]
+        for y in range(h):
+            row = px[(h - 1 - y) * stride:(h - y) * stride]
+            for c in range(nc):
+                out[y * stride + c:(y + 1) * stride:nc] = row[c::nc][::-1]
+        nw, nh = w, h
     else:
-        out = [[px[y][x] for y in range(h - 1, -1, -1)] for x in range(w)]
-    nh, nw = len(out), len(out[0]) if out else 0
-    if pic.mode == "1":
-        data = b"".join(bytes(sum(bit << (7 - k) for k, bit in enumerate(row[i:i + 8])) for i in range(0, nw, 8))
-                        for row in out)
-    else:
-        data = b"".join(b"".join(row) for row in out)
+        nw, nh = h, w
+        for k in range(w):  # each new row is a column of the old picture
+            x = w - 1 - k if degrees == 90 else k  # 90: the right column on top, bottom pixel last; 270: the left
+            for c in range(nc):
+                column = px[x * nc + c::stride]
+                out[k * h * nc + c:(k + 1) * h * nc:nc] = column if degrees == 90 else column[::-1]
+    data = _pack(bytes(out), nw, nh) if bits else bytes(out)
     return Picture(nw, nh, pic.mode, data)
 
 

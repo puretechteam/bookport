@@ -62,6 +62,7 @@ ELEMENT_ATTRS = {
 FLOW_ONLY = frozenset(["address", "article", "aside", "blockquote", "details", "dialog", "div", "dl", "fieldset", "figcaption", "figure", "footer", "form", "h1", "h2", "h3", "h4", "h5", "h6", "header", "hgroup", "hr", "main", "menu", "nav", "ol", "p", "pre", "section", "table", "ul", "center", "li", "dd", "dt", "tr", "td", "th", "tbody", "thead", "tfoot", "caption"])
 PHRASING_PARENTS = frozenset(["p", "h1", "h2", "h3", "h4", "h5", "h6", "span", "a", "b", "i", "em", "strong", "small", "sub", "sup", "u", "s", "code", "abbr", "cite", "q", "dfn", "kbd", "samp", "var", "mark", "label", "bdi", "bdo", "time", "data", "ruby", "rt", "rp", "pre", "legend", "summary", "dt", "caption"])
 _ID_OK = re.compile(r"^[A-Za-z_][\w.-]*$")
+SPAN_MAX = {"colspan": 1000, "span": 1000, "rowspan": 65534}
 CORE_IMAGES = {"image/jpeg", "image/png", "image/gif", "image/svg+xml", "image/webp"}
 
 
@@ -114,7 +115,7 @@ def presentational_to_css(el):
     if tag == "table":
         if "border" in a:
             b = a.pop("border").strip() or "1"
-            if b.isdigit() and int(b) > 0:
+            if (markup.whole(b) or 0) > 0:
                 css.append("border-collapse: collapse")
                 el.set("class", (el.get("class", "") + " bp-bordered").strip())
         if "cellpadding" in a:
@@ -179,6 +180,7 @@ class Cleaner:
     def __init__(self, book: Book):
         self.book = book
         self.ids: dict[str, set] = {}
+        self.old_ids: dict[str, dict[str, str]] = {}  # page -> {id it had: id it has now}
 
     def run(self, keep_scripts: bool = False) -> None:
         book = self.book
@@ -187,6 +189,14 @@ class Cleaner:
                 root = book.tree(href)
                 self.structure(href, root, keep_scripts)
                 self.ids[href] = {e.get("id") for e in root.iter() if e.get("id")}
+                # every page's renamed ids, before any links are fixed: a link from an earlier page to a
+                # later one needs the later page's new names too
+                old_ids: dict[str, str] = {}
+                for e in root.iter():
+                    old = e.attrib.pop("data-old-id", None)
+                    if old is not None and old not in self.ids[href]:  # a repeat of an id still in use keeps its links
+                        old_ids.setdefault(old, e.get("id"))
+                self.old_ids[href] = old_ids
         for href, res in list(book.resources.items()):
             if res.is_document:
                 root = book.tree(href)
@@ -231,8 +241,8 @@ class Cleaner:
         # body styles move to <head>
         parent = {c: p for p in root.iter() for c in p}
         for st in [e for e in body.iter() if e.tag == "style"]:
+            _keep_tail(parent[st], st)  # while it is still there, so its tail stays where it was
             parent[st].remove(st)
-            _keep_tail(parent[st], st)
             st.tail = None
             head.append(st)
         self._fix_tree(body, parent, keep_scripts)
@@ -283,9 +293,7 @@ class Cleaner:
                     pass  # <a> is transparent: allowed if its parent allows the content
                 elif el.tag == "dt":
                     el.tag = "dd"
-                else:
-                    el.tag = "span"
-                    # inline formatting wrapping blocks becomes a div with the same look
+                else:  # inline formatting wrapping blocks becomes a div with the same look
                     el.tag = "div"
         parent = {c: p for p in body.iter() for c in p}
         # 3. <a> inside <a>; lists hold only <li>; tables hold rows; empty headings are fine
@@ -372,11 +380,9 @@ class Cleaner:
         allowed = ELEMENT_ATTRS.get(el.tag, set())
         for k in list(el.attrib):
             low = k.lower()
-            if low.startswith("on") and not keep_event(low):
+            if low.startswith("on"):  # event handlers: books run no scripts
                 del el.attrib[k]
             elif low.startswith(("data-", "aria-")) or k in GLOBAL_ATTRS or k in allowed:
-                if low == "data-pad":
-                    continue
                 continue
             elif k == "name" and el.tag == "a":
                 name = el.attrib.pop("name")
@@ -405,8 +411,10 @@ class Cleaner:
                     n = int(float(v.strip()))
                     if k in ("colspan", "span") and n < 1 or k == "rowspan" and n < 0:
                         raise ValueError
+                    # HTML's own limits for spans; numbers far beyond any list's
+                    n = min(n, SPAN_MAX[k]) if k in SPAN_MAX else max(-10**9, min(n, 10**9))
                     el.set(k, str(n))
-                except ValueError:
+                except (ValueError, OverflowError):  # "x", "nan", "1e999"
                     del el.attrib[k]
         for k in ("width", "height"):
             v = el.get(k)
@@ -444,8 +452,7 @@ class Cleaner:
         for c in list(el):
             el.remove(c)
             if isinstance(c.tag, str) and c.tag in ("li", "script", "template"):
-                if pending is not None:
-                    pending = None
+                pending = None
                 new_children.append(c)
             else:
                 if pending is None:
@@ -453,10 +460,6 @@ class Cleaner:
                     pending.set("style", "list-style-type: none")
                     new_children.append(pending)
                 pending.append(c)
-                if c.tail and c.tail.strip():
-                    pass
-                else:
-                    pass
             if c.tail and c.tail.strip() and c.tag == "li":
                 target = ET.Element("li")
                 target.set("style", "list-style-type: none")
@@ -567,7 +570,8 @@ class Cleaner:
             _ensure_style(table, "border: 1px solid")
 
     def _unique_ids(self, root):
-        seen = set()
+        seen: set[str] = set()
+        next_n: dict[str, int] = {}
         for el in root.iter():
             i = el.get("id")
             if i is None:
@@ -577,10 +581,13 @@ class Cleaner:
                 new = re.sub(r"[^\w.-]", "_", new)
                 if not new or not (new[0].isalpha() or new[0] == "_"):
                     new = "id_" + new
-            base, n = new, 1
-            while new in seen:
+            if new in seen:
+                base = new
+                n = next_n.get(base, 1)  # where the last search for this name stopped, not 1 every time
+                while f"{base}_{n}" in seen:
+                    n += 1
                 new = f"{base}_{n}"
-                n += 1
+                next_n[base] = n + 1
             seen.add(new)
             if new != i:
                 el.set("id", new)
@@ -589,12 +596,6 @@ class Cleaner:
     # --- links --------------------------------------------------------------------------------
     def links(self, href, root):
         book = self.book
-        old_ids = {}
-        for el in root.iter():
-            if el.get("data-old-id") is not None:
-                old_ids.setdefault(el.attrib.pop("data-old-id"), el.get("id"))
-        self._old_ids = getattr(self, "_old_ids", {})
-        self._old_ids[href] = old_ids
         parent = {c: p for p in root.iter() for c in p}
         head = root.find("head")
         for el in list(root.iter()):
@@ -674,7 +675,7 @@ class Cleaner:
             from urllib.parse import unquote
             frag = unquote(frag)
             ids = self.ids.get(target, set())
-            frag = self._old_ids.get(target, {}).get(frag, frag) if hasattr(self, "_old_ids") else frag
+            frag = self.old_ids.get(target, {}).get(frag, frag)
             if frag not in ids:
                 frag = ""
         return relative(href, target + (f"#{frag}" if frag else ""))
@@ -711,10 +712,6 @@ class Cleaner:
         # @font-face blocks whose src is gone break epubcheck
         text = re.sub(r"@font-face\s*\{[^}]*\}", lambda m: m.group(0) if "url(" in m.group(0) else "", text)
         return text
-
-
-def keep_event(_name):
-    return False
 
 
 def clean_inline_style(style: str) -> str:

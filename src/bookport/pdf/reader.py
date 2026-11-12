@@ -6,9 +6,11 @@ words hyphenated across lines are joined.
 
 from __future__ import annotations
 
+import bisect
 import itertools
 import re
 import statistics
+import struct
 import xml.etree.ElementTree as ET
 from collections import Counter
 from dataclasses import dataclass, field
@@ -18,16 +20,75 @@ from .. import limits, markup
 from ..book import Book, Metadata, TocEntry
 from ..errors import BookportError, DRMError
 from .encodings import BASE_ENCODINGS, STANDARD, glyph_to_unicode
-from .parser import _CONTENT, Document, Ref, Stream, _literal, _name, content_tokens, text_string
+from .parser import _CONTENT, Document, Ref, Stream, _literal, _name, content_tokens, named_dests, text_string
 
 # --- fonts ---------------------------------------------------------------------------------------
 
+class _Spans:
+    """Values for runs of whole numbers kept as (first, last, value) and looked up when asked: a range in a
+    font's tables can cover 65,536 codes, and a file can hold thousands of them (a few KB that would expand
+    into tens of millions of entries)."""
+
+    def __init__(self):
+        self.firsts: list[int] = []
+        self.spans: list[tuple[int, int, object]] = []
+        self._sorted = True
+        self._reach: list[int] | None = None
+
+    def add(self, first: int, last: int, value) -> None:
+        if self.firsts and first < self.firsts[-1]:
+            self._sorted = False
+        self.firsts.append(first)
+        self.spans.append((first, last, value))
+        self._reach = None
+
+    def find(self, code: int):
+        """(first, value) of the span that holds code, or None."""
+        if not self._sorted or self._reach is None:
+            self.spans.sort(key=lambda sp: sp[0])
+            self.firsts = [sp[0] for sp in self.spans]
+            self._reach = list(itertools.accumulate((sp[1] for sp in self.spans), max))  # the furthest any span so far goes
+            self._sorted = True
+        k = bisect.bisect_right(self.firsts, code) - 1
+        steps = 0
+        while k >= 0 and self._reach[k] >= code and steps < 64:
+            first, last, value = self.spans[k]
+            if last >= code:
+                return first, value
+            k -= 1
+            steps += 1
+        return None
+
+
+class _CodeMap(dict):
+    """Code -> text: single codes in the dictionary, bfrange runs as spans (code length -> _Spans of (prefix, the
+    last two bytes' start)), looked up by get() as if they were in it."""
+
+    def __init__(self):
+        super().__init__()
+        self.spans: dict[int, _Spans] = {}
+
+    def __bool__(self):
+        return bool(len(self) or self.spans)
+
+    def get(self, code, default=None):
+        text = dict.get(self, code)
+        if text is None and self.spans and isinstance(code, (bytes, bytearray)):
+            spans = self.spans.get(len(code))
+            n = int.from_bytes(code, "big")
+            got = spans.find(n) if spans is not None else None
+            if got is not None:
+                first, (prefix, start) = got
+                text = _utf16(prefix + ((start + n - first) & 0xFFFF).to_bytes(2, "big"))
+        return default if text is None else text
+
+
 class CMap:
-    """A ToUnicode CMap: code space ranges plus code -> text."""
+    """A ToUnicode CMap: code space ranges plus code -> text (map)."""
 
     def __init__(self, data: bytes):
         self.ranges: list[tuple[int, bytes, bytes]] = []
-        self.map: dict[bytes, str] = {}
+        self.map = _CodeMap()
         toks = content_tokens(data)
         i = 0
         n = len(toks)
@@ -67,15 +128,16 @@ class CMap:
                     if isinstance(lo, bytes) and isinstance(hi, bytes) and isinstance(dst, bytes):
                         a, b = int.from_bytes(lo, "big"), int.from_bytes(hi, "big")
                         base = bytes(dst)
-                        start = int.from_bytes(base[-2:] or b"\0", "big")
-                        prefix = base[:-2]
-                        for off in range(min(b - a + 1, 65536)):
-                            code = (a + off).to_bytes(len(lo), "big")
-                            self.map[code] = _utf16(prefix + ((start + off) & 0xFFFF).to_bytes(2, "big"))
+                        if b >= a:
+                            self.map.spans.setdefault(len(lo), _Spans()).add(
+                                a, min(b, a + 65535), (base[:-2], int.from_bytes(base[-2:] or b"\0", "big")))
                     i += 3
             else:
                 i += 1
         self.ranges.sort(key=lambda r: r[0])
+
+    def get(self, code: bytes) -> str | None:
+        return self.map.get(code)
 
     def code_length(self, data: bytes, pos: int, default: int) -> int:
         for length, lo, hi in self.ranges:
@@ -139,10 +201,13 @@ class Font:
             self.type3_scale = float(r(fm[0])) if fm and isinstance(r(fm[0]), (int, float)) else 0.001
         self._fixed_two = self.cid and (self.tounicode is None or not self.tounicode.ranges or all(
             length == 2 for length, _lo, _hi in self.tounicode.ranges))
-        self.vertical = False
-        if self.cid:
-            enc = r(fdict.get("Encoding"))
-            self.vertical = isinstance(enc, str) and enc.endswith("-V")
+        # without ToUnicode a CID is no character: only a Unicode CMap (UniGB-UCS2-H...) makes the code one;
+        # for Identity-H a TrueType font's own cmap, turned round, says which character each glyph draws
+        enc = r(fdict.get("Encoding")) if self.cid else None
+        self._codes_are_unicode = isinstance(enc, str) and enc.startswith("Uni") and ("UCS2" in enc or "UTF16" in enc)
+        self._identity = isinstance(enc, str) and enc in ("Identity-H", "Identity-V")
+        self._doc, self._descendant = doc, (d0 if self.cid else None)
+        self._by_glyph: dict[int, str] | None = None
 
     def _encoding(self, doc, fdict) -> dict[int, str]:
         r = doc.resolve
@@ -171,6 +236,35 @@ class Font:
                     code += 1
         return table
 
+    def _glyph_text(self, cid: int) -> str:
+        """The character an Identity-H CID draws, from the embedded TrueType font's cmap turned round ("" when it
+        can't be told: chr(CID) gave letters that weren't on the page)."""
+        if self._by_glyph is None:
+            self._by_glyph = {}
+            if self._identity and isinstance(self._descendant, dict):
+                r = self._doc.resolve
+                desc = r(self._descendant.get("FontDescriptor"))
+                file = r(desc.get("FontFile2")) if isinstance(desc, dict) else None
+                to_gid = r(self._descendant.get("CIDToGIDMap"))
+                try:
+                    if isinstance(file, Stream):
+                        from .ttf import load
+                        font = load(self._doc.decode(file))
+                        for cp, gid in sorted(font.cmap.items()):
+                            if gid and cp >= 32 and not 0xE000 <= cp <= 0xF8FF and not 0xD800 <= cp <= 0xDFFF:
+                                self._by_glyph.setdefault(gid, chr(cp))
+                        if isinstance(to_gid, Stream):  # CID -> glyph, two bytes each
+                            table = self._doc.decode(to_gid)
+                            by_cid = {}
+                            for c in range(min(len(table) // 2, 1 << 16)):
+                                g = int.from_bytes(table[2 * c:2 * c + 2], "big")
+                                if g in self._by_glyph:
+                                    by_cid[c] = self._by_glyph[g]
+                            self._by_glyph = by_cid
+                except (BookportError, ValueError, IndexError, KeyError, TypeError, struct.error):
+                    self._by_glyph = {}
+        return self._by_glyph.get(cid, "")
+
     def decode(self, s: bytes) -> list[tuple[int, str, float]]:
         """(code, text, advance in thousandths of text space) for each character code."""
         out = []
@@ -182,16 +276,21 @@ class Font:
                 length = 2 if fixed else self.tounicode.code_length(s, i, 2) if self.tounicode and self.tounicode.ranges else 2
                 raw = s[i:i + length]
                 code = int.from_bytes(raw, "big")
-                text = self.tounicode.map.get(raw) if self.tounicode else None
+                text = self.tounicode.get(raw) if self.tounicode else None
                 if text is None:
-                    text = chr(code) if 32 <= code < 0xD800 and not self.tounicode else ""
+                    if self.tounicode:
+                        text = ""
+                    elif self._codes_are_unicode:
+                        text = chr(code) if 32 <= code < 0xD800 else ""
+                    else:
+                        text = self._glyph_text(code)
                 out.append((code, text, self.widths.get(code, self.dw)))
                 i += length
             return out
         for b in s:
             text = None
             if self.tounicode:
-                text = self.tounicode.map.get(bytes([b]))
+                text = self.tounicode.get(bytes([b]))
             if text is None:
                 text = self.encoding.get(b, chr(b) if 32 <= b < 127 else "")
             w = self.widths.get(b, self.dw)
@@ -201,21 +300,36 @@ class Font:
         return out
 
 
-def _cid_widths(arr, r) -> dict[int, float]:
-    out = {}
+class _Widths:
+    """A CID font's /W: listed widths in a dictionary, "first last width" ranges as spans."""
+
+    def __init__(self):
+        self.listed: dict[int, float] = {}
+        self.ranges = _Spans()
+
+    def get(self, code: int, default):
+        w = self.listed.get(code)
+        if w is None:
+            got = self.ranges.find(code)
+            w = got[1] if got is not None else default
+        return w
+
+
+def _cid_widths(arr, r) -> _Widths:
+    out = _Widths()
     i = 0
     while i < len(arr):
         first = r(arr[i])
         nxt = r(arr[i + 1]) if i + 1 < len(arr) else None
         if isinstance(nxt, list):
-            for k, w in enumerate(nxt):
-                out[first + k] = r(w) or 0
+            if isinstance(first, int):
+                for k, w in enumerate(nxt):
+                    out.listed[first + k] = r(w) or 0
             i += 2
         elif i + 2 < len(arr):
             last, w = nxt, r(arr[i + 2])
-            if isinstance(first, int) and isinstance(last, int) and last - first < 70000:
-                for c in range(first, last + 1):
-                    out[c] = w or 0
+            if isinstance(first, int) and isinstance(last, int) and 0 <= last - first < 70000:
+                out.ranges.add(first, last, w if isinstance(w, (int, float)) else 0)
             i += 3
         else:
             break
@@ -235,6 +349,7 @@ class Span:
     italic: bool
     mono: bool
     order: int
+    href: str | None = None  # a web link over these words
 
 
 @dataclass
@@ -306,6 +421,11 @@ class Interpreter:
                                          text_string(uri) if isinstance(uri, bytes) else str(uri)))
                     except (TypeError, ValueError):
                         pass
+        for x0, y0, x1, y1, uri in pc.links[:2000]:  # each link's words: those whose middle is under it
+            for s in pc.spans:
+                mx, my = (s.x + s.x1) / 2, s.y + s.size * 0.3
+                if x0 <= mx <= x1 and y0 <= my <= y1:
+                    s.href = uri
         return pc
 
     def run(self, data: bytes, resources: dict, ctm, pc: PageContent, depth: int):
@@ -323,7 +443,6 @@ class Interpreter:
         th = 1.0
         tl = 0.0
         rise = 0.0
-        in_text = False
 
         def show(s: bytes):
             nonlocal tm
@@ -348,10 +467,13 @@ class Interpreter:
                 pc.spans.append(Span(start[0], y, end[4], eff, txt, font.bold, font.italic, font.mono, self.order))
 
         push = stack.append
-        toks = _CONTENT.findall(data)
-        self.ops += len(toks)
-        if self.ops > limits.MAX_PDF_OPERATORS:
+        toks = _CONTENT.findall(_without_inline_images(data))
+        room = limits.MAX_PDF_OPERATORS - self.ops
+        if room <= 0:
             return  # the rest of an endlessly repeating page is dropped
+        if len(toks) > room:
+            toks = toks[:room]
+        self.ops += len(toks)
         for tok in toks:
             c = tok[0]
             # operands, classified by their first byte (the tokenizer and interpreter in one loop)
@@ -409,9 +531,6 @@ class Interpreter:
             try:
                 if op == b"BT":
                     tm = lm = (1, 0, 0, 1, 0, 0)
-                    in_text = True
-                elif op == b"ET":
-                    in_text = False
                 elif op == b"Tf" and len(stack) >= 2:
                     name, size = stack[-2], stack[-1]
                     size = float(size) if isinstance(size, (int, float)) else 12.0
@@ -504,12 +623,70 @@ class Interpreter:
                                     self.run(body, res, _mul(fmt, ctm), pc, depth + 1)
                                 finally:
                                     self.active.discard(key)
-                elif op == b"BI":
-                    pass
             except (TypeError, ValueError, ZeroDivisionError, IndexError):
                 pass
             stack.clear()
-        del in_text
+
+
+_BI = re.compile(rb"(?<![^\s\]>)}])BI(?=[\s/])")
+_EI = re.compile(rb"\sEI(?=[\s/\[<(%]|\Z)")
+_INLINE_LAST = re.compile(rb"\s*EI(?=[\s/\[<(%]|\Z)")
+_INLINE_COLOURS = {b"G": 1, b"DeviceGray": 1, b"CalGray": 1, b"RGB": 3, b"DeviceRGB": 3, b"CalRGB": 3, b"CMYK": 4,
+                   b"DeviceCMYK": 4, b"I": 1, b"Indexed": 1}
+
+
+def _without_inline_images(data: bytes) -> bytes:
+    """Content with each inline image (BI ... ID data EI) taken out: its data is binary, and read as tokens it
+    would run as operators (a stray Tm or ' moves or adds text)."""
+    if b"BI" not in data:
+        return data
+    out = []
+    pos = 0
+    while True:
+        m = _BI.search(data, pos)
+        if m is None:
+            break
+        keys: dict[bytes, bytes] = {}
+        prev = None
+        start = None
+        for k, t in enumerate(_CONTENT.finditer(data, m.end())):
+            tok = t.group()
+            if tok == b"ID":
+                start = t.end() + 1  # one white-space byte after ID, then the data
+                break
+            if k > 200:
+                break
+            if prev is not None and prev[:1] == b"/":
+                keys[prev[1:]] = tok
+            prev = tok
+        if start is None:
+            break
+        end = None
+        length = keys.get(b"L") or keys.get(b"Length")
+        if length is not None and length.isdigit():
+            end = start + int(length)
+        elif b"F" not in keys and b"Filter" not in keys:
+            try:
+                w = int(keys.get(b"W") or keys.get(b"Width") or b"")
+                h = int(keys.get(b"H") or keys.get(b"Height") or b"")
+                mask = (keys.get(b"IM") or keys.get(b"ImageMask")) == b"true"
+                bpc = 1 if mask else int(keys.get(b"BPC") or keys.get(b"BitsPerComponent") or b"8")
+                n = 1 if mask else _INLINE_COLOURS.get((keys.get(b"CS") or keys.get(b"ColorSpace") or b"/")[1:])
+                if n is not None and 0 < w and 0 < h and bpc in (1, 2, 4, 8, 16):
+                    end = start + (w * n * bpc + 7) // 8 * h
+            except ValueError:
+                end = None
+        last = _INLINE_LAST.match(data, end) if end is not None and end <= len(data) else None
+        if last is None:
+            last = _EI.search(data, start)
+        out.append(data[pos:m.start()])
+        if last is None:
+            pos = len(data)  # no end: the rest is the picture
+            break
+        out.append(b" ")
+        pos = last.end()
+    out.append(data[pos:])
+    return b"".join(out)
 
 
 # --- reflow -----------------------------------------------------------------------------------------
@@ -522,6 +699,7 @@ class TextLine:
     size: float
     runs: list  # (text, bold, italic, mono)
     page: int
+    column: tuple | None = None  # (left, right) of the column it's in, on a page set in columns
 
     @property
     def text(self):
@@ -554,7 +732,7 @@ def lines_of(pc: PageContent, page_index: int) -> list[TextLine]:
                 gap = s.x - prev.x1
                 if gap > max(prev.size, s.size) * 0.18 and not prev.text.endswith(" ") and not text.startswith(" "):
                     text = " " + text
-            key = (s.bold, s.italic, s.mono)
+            key = (s.bold, s.italic, s.mono, s.href)
             if runs and runs[-1][1:] == key:
                 runs[-1] = (runs[-1][0] + text,) + key
             else:
@@ -562,8 +740,70 @@ def lines_of(pc: PageContent, page_index: int) -> list[TextLine]:
             prev = s
         size = Counter(round(s.size, 1) for s in group for _ in s.text).most_common(1)[0][0]
         out.append(TextLine(group[0].y, group[0].x, group[-1].x1, size, runs, page_index))
-    out.sort(key=lambda ln: -ln.y)
+    return _reading_order(out)
+
+
+def _reading_order(lines: list[TextLine], depth: int = 0) -> list[TextLine]:
+    """Top to bottom; where the page is set in columns (lines side by side with a gap between them that no
+    line crosses), each column in turn from the left, between the lines that span them (a title, a wide
+    caption). Two-column pages used to read across the gap, a line of each column in turn."""
+    lines = sorted(lines, key=lambda ln: -ln.y)
+    if len(lines) < 6 or depth > 2:
+        return lines
+    gutter = _gutter(lines)
+    if gutter is None:
+        return lines
+    out: list[TextLine] = []
+    band: list[TextLine] = []
+
+    def flush():
+        left = [ln for ln in band if ln.x1 <= gutter]
+        right = [ln for ln in band if ln.x0 >= gutter]
+        for side, edge in ((left, (min((ln.x0 for ln in left), default=0), gutter)),
+                           (right, (gutter, max((ln.x1 for ln in right), default=0)))):
+            for ln in side:
+                ln.column = (round(edge[0]), round(edge[1]))
+            out.extend(_reading_order(side, depth + 1))
+        band.clear()
+
+    for ln in lines:
+        if ln.x0 < gutter < ln.x1:
+            flush()
+            out.append(ln)
+        else:
+            band.append(ln)
+    flush()
     return out
+
+
+def _gutter(lines: list[TextLine]) -> float | None:
+    """The x of a gap between two columns of text, or None: at least 3 lines of words each side (not a column
+    of page numbers or labels), side by side down the page, and few lines (titles) across it."""
+    size = statistics.median(ln.size for ln in lines) or 10
+    best = None
+    ends = sorted({round(ln.x1, 1) for ln in lines})
+    for e in ends[::max(1, len(ends) // 150)]:  # a dense page (a map, a chart) needn't try every line's end
+        left = [ln for ln in lines if ln.x1 <= e + 0.5]
+        right = [ln for ln in lines if ln.x0 > e + 0.5]
+        if len(left) < 3 or len(right) < 3:
+            continue
+        start = min(ln.x0 for ln in right)
+        if start - e < size * 0.8:
+            continue
+        across = len(lines) - len(left) - len(right)
+        if across > max(2, len(lines) * 0.15):
+            continue
+        if statistics.median(len(ln.text) for ln in left) < 12 or statistics.median(len(ln.text) for ln in right) < 12:
+            continue
+        top, bottom = min(max(ln.y for ln in left), max(ln.y for ln in right)), max(min(ln.y for ln in left),
+                                                                                 min(ln.y for ln in right))
+        shorter = min(max(ln.y for ln in left) - min(ln.y for ln in left), max(ln.y for ln in right) - min(ln.y for ln in right))
+        if top - bottom < max(shorter * 0.5, size):
+            continue  # one above the other, not side by side
+        score = min(len(left), len(right))
+        if best is None or score > best[0]:
+            best = (score, (e + start) / 2)
+    return best[1] if best else None
 
 
 def _strip_furniture(pages: list[list[TextLine]], heights: list[float]) -> None:
@@ -571,7 +811,7 @@ def _strip_furniture(pages: list[list[TextLine]], heights: list[float]) -> None:
     ("Chapter 12" and "Chapter 13" match); digits inside a word ("A320", "1880s") stay."""
     counts: Counter = Counter()
     for lines in pages:
-        for ln in lines[:2] + lines[-2:]:
+        for ln in lines[:2] + lines[2:][-2:]:
             counts[re.sub(r"\b\d+\b", "#", ln.text.strip().lower())] += 1
     n = len(pages)
     for i, lines in enumerate(pages):
@@ -598,10 +838,20 @@ def reflow(pages: list[list[TextLine]], pictures: dict[int, list], width: float)
     for ln in all_lines:
         body[round(ln.size, 1)] += len(ln.text)
     body_size = body.most_common(1)[0][0] or 10
-    lefts = Counter(round(ln.x0) for ln in all_lines if abs(ln.size - body_size) < 0.6)
-    left = lefts.most_common(1)[0][0] if lefts else 0
-    rights = sorted(ln.x1 for ln in all_lines if abs(ln.size - body_size) < 0.6)
-    right = rights[int(len(rights) * 0.9)] if rights else width
+
+    def margins(lines, default):
+        """Where body lines start (the most common left edge) and end (90% end before it)."""
+        lefts = Counter(round(ln.x0) for ln in lines if abs(ln.size - body_size) < 0.6)
+        rights = sorted(ln.x1 for ln in lines if abs(ln.size - body_size) < 0.6)
+        return (lefts.most_common(1)[0][0] if lefts else default[0],
+                rights[int(len(rights) * 0.9)] if rights else default[1])
+
+    page_margins = margins(all_lines, (0, width))
+    by_column: dict[tuple, list] = {}
+    for ln in all_lines:
+        if ln.column is not None:
+            by_column.setdefault(ln.column, []).append(ln)
+    column_margins = {col: margins(lns, page_margins) for col, lns in by_column.items()}
     gaps = []
     for lines in pages:
         for a, b in itertools.pairwise(lines):
@@ -622,6 +872,7 @@ def reflow(pages: list[list[TextLine]], pictures: dict[int, list], width: float)
                     para = None
                 out.append(("img", pics.pop(0).key, pi))
             heading = round(ln.size, 1) in level_of
+            left, right = column_margins.get(ln.column, page_margins)
             new = para is None
             if not new:
                 gap = prev.y - ln.y
@@ -712,10 +963,14 @@ def extract_image(doc: Document, key) -> tuple[bytes, str] | None:
     w, h = r(d.get("Width")), r(d.get("Height"))
     if not isinstance(w, int) or not isinstance(h, int) or w < 8 or h < 8 or w * h > limits.MAX_PIXELS:
         return None
+    if r(d.get("ImageMask")):
+        return None  # a stencil (the text of a scan laid over its background), no picture of its own
     if filters and filters[-1] in ("DCTDecode", "DCT"):
         data = doc.decode(xo)
         return (data, "image/jpeg") if data[:2] == b"\xff\xd8" else None
-    if filters and filters[-1] in ("JPXDecode", "CCITTFaxDecode", "CCF", "JBIG2Decode"):
+    if filters and filters[-1] in ("CCITTFaxDecode", "CCF"):
+        return _ccitt(doc, xo, w, h)
+    if filters and filters[-1] in ("JPXDecode", "JBIG2Decode"):
         return None
     data = doc.decode(xo)
     bpc = r(d.get("BitsPerComponent", 8)) or 8
@@ -726,7 +981,6 @@ def extract_image(doc: Document, key) -> tuple[bytes, str] | None:
         kind = str(r(cs[0]))
         if kind == "Indexed" and len(cs) >= 4:
             base = r(cs[1])
-            hival = r(cs[2])
             lookup = r(cs[3])
             if isinstance(lookup, Stream):
                 lookup = doc.decode(lookup)
@@ -738,7 +992,7 @@ def extract_image(doc: Document, key) -> tuple[bytes, str] | None:
                 base_n = 1
             elif str(base) == "DeviceCMYK":
                 base_n = 4
-            palette = (bytes(lookup or b""), base_n, hival)
+            palette = (bytes(lookup or b""), base_n)
             ncomp = 1
         elif kind == "ICCBased":
             icc = r(cs[1])
@@ -754,10 +1008,11 @@ def extract_image(doc: Document, key) -> tuple[bytes, str] | None:
     elif cs in ("DeviceCMYK", "CMYK"):
         ncomp = 4
     from ..images import Raster, encode_png
-    if r(d.get("ImageMask")):
-        return None
     if bpc not in (1, 2, 4, 8, 16) or ncomp not in (1, 3, 4):
         return None
+    decode_arr = r(d.get("Decode"))
+    inverted = palette is None and ncomp == 1 and isinstance(decode_arr, list) and len(decode_arr) == 2 \
+        and r(decode_arr[0]) == 1 and r(decode_arr[1]) == 0  # [1 0]: 0 is white
     row = (w * ncomp * bpc + 7) // 8
     if len(data) < row * h:
         data += bytes(row * h - len(data))
@@ -766,6 +1021,8 @@ def extract_image(doc: Document, key) -> tuple[bytes, str] | None:
         line = data[y * row:(y + 1) * row]
         if bpc == 8:
             pixels += line[:w * ncomp]
+        elif bpc == 1 and palette is None and ncomp == 1:
+            pixels += b"".join(_GREY_BITS[b] for b in line)[:w]
         elif bpc == 16:
             pixels += line[0:w * ncomp * 2:2]
         else:
@@ -778,7 +1035,7 @@ def extract_image(doc: Document, key) -> tuple[bytes, str] | None:
                 vals = [v * 255 // mask for v in vals]
             pixels += bytes(vals)
     if palette is not None:
-        lut, n, _hival = palette
+        lut, n = palette
         out = bytearray()
         for v in pixels:
             entry = lut[v * n:v * n + n]
@@ -794,7 +1051,38 @@ def extract_image(doc: Document, key) -> tuple[bytes, str] | None:
             out += _cmyk(pixels[i:i + 4])
         return encode_png(Raster(w, h, "RGB", bytes(out))), "image/png"
     mode = "L" if ncomp == 1 else "RGB"
+    if inverted:
+        pixels = pixels.translate(_INVERT)
     return encode_png(Raster(w, h, mode, bytes(pixels[:w * h * (1 if ncomp == 1 else 3)]))), "image/png"
+
+
+_GREY_BITS = [bytes(255 if (b >> (7 - k)) & 1 else 0 for k in range(8)) for b in range(256)]  # 1-bit grey, 1 = white
+_INVERT = bytes(range(255, -1, -1))
+
+
+def _ccitt(doc: Document, xo: Stream, w: int, h: int) -> tuple[bytes, str] | None:
+    """A CCITT Group 4 picture (K < 0: how scanners store black-and-white pages) as a PNG; None for the
+    one-dimensional and mixed kinds (K >= 0), which aren't read."""
+    from ..djvu import mmr
+    from ..images import Raster, encode_png
+    r = doc.resolve
+    parms = r(xo.dict.get("DecodeParms") or xo.dict.get("DP"))
+    if isinstance(parms, list):
+        parms = r(parms[-1]) if parms else None
+    parms = parms if isinstance(parms, dict) else {}
+    k, cols = r(parms.get("K", 0)), r(parms.get("Columns", 1728))
+    if not isinstance(k, int) or k >= 0 or not isinstance(cols, int) or cols != w:
+        return None
+    rows = mmr.decode(doc.decode(xo), w, h)  # bit c set: a black pixel in column c (as the filter gives it)
+    # "1" (a set bit, a black pixel) comes out as the sample 0, black; with BlackIs1 as 1, which grey shows white
+    ones = bytes.maketrans(b"01", b"\xff\x00")
+    if r(parms.get("BlackIs1")) is True:
+        ones = bytes.maketrans(b"01", b"\x00\xff")
+    decode_arr = r(xo.dict.get("Decode"))
+    if isinstance(decode_arr, list) and len(decode_arr) == 2 and r(decode_arr[0]) == 1 and r(decode_arr[1]) == 0:
+        ones = bytes.maketrans(b"01", bytes((ones[ord("1")], ones[ord("0")])))  # [1 0]: the other way round
+    pixels = b"".join(format(row, f"0{w}b")[::-1].encode("ascii").translate(ones) for row in rows)
+    return encode_png(Raster(w, h, "L", pixels)), "image/png"
 
 
 def _cmyk(px) -> bytes:
@@ -845,7 +1133,7 @@ def _metadata(doc: Document) -> Metadata:
 def _outline(doc: Document, page_index: dict) -> list:
     r = doc.resolve
     outlines = r(doc.root.get("Outlines"))
-    names = _named_dests(doc)
+    names = named_dests(doc)
     out = []
 
     def dest_page(item):
@@ -855,7 +1143,7 @@ def _outline(doc: Document, page_index: dict) -> list:
             if isinstance(action, dict) and r(action.get("S")) == "GoTo":
                 dest = r(action.get("D"))
         if isinstance(dest, (bytes, str)):
-            dest = names.get(bytes(dest) if isinstance(dest, bytes) else dest.encode("latin-1"))
+            dest = names.get(bytes(dest).decode("latin-1") if isinstance(dest, bytes) else str(dest))
             dest = r(dest)
             if isinstance(dest, dict):
                 dest = r(dest.get("D"))
@@ -891,33 +1179,6 @@ def _outline(doc: Document, page_index: dict) -> list:
 
     if isinstance(outlines, dict):
         out = walk(outlines.get("First"), 0, set())
-    return out
-
-
-def _named_dests(doc: Document) -> dict[bytes, object]:
-    r = doc.resolve
-    out = {}
-    names = r(doc.root.get("Names"))
-    tree = r(names.get("Dests")) if isinstance(names, dict) else None
-
-    def walk(node, depth):
-        node = r(node)
-        if not isinstance(node, dict) or depth > 20:
-            return
-        arr = r(node.get("Names")) or []
-        for k in range(0, len(arr) - 1, 2):
-            key = r(arr[k])
-            if isinstance(key, bytes):
-                out[bytes(key)] = arr[k + 1]
-        for kid in r(node.get("Kids")) or []:
-            walk(kid, depth + 1)
-
-    if tree is not None:
-        walk(tree, 0)
-    old = r(doc.root.get("Dests"))
-    if isinstance(old, dict):
-        for k, v in old.items():
-            out[k.encode("latin-1")] = v
     return out
 
 
@@ -958,7 +1219,12 @@ def read_pdf(path: Path) -> Book:
     def image_href(key):
         k = key.num if isinstance(key, Ref) else id(key)
         if k not in image_hrefs:
-            got = extract_image(doc, key)
+            try:
+                got = extract_image(doc, key)
+            except limits.LimitError:
+                raise
+            except (BookportError, ValueError, TypeError, IndexError, KeyError, AttributeError, RecursionError):
+                got = None  # a damaged picture: left out
             image_hrefs[k] = None
             if got is not None:
                 data_, mt = got
@@ -1001,8 +1267,10 @@ def read_pdf(path: Path) -> Book:
             continue
         kind, runs, _pi = item
         el = ET.SubElement(body, kind)
-        for text, bold, italic, mono in runs:
+        for text, bold, italic, mono, *link in runs:
             target = el
+            if link and link[0]:
+                target = ET.SubElement(target, "a", {"href": link[0]})
             if bold and kind == "p":
                 target = ET.SubElement(target, "b")
             if italic:
@@ -1010,7 +1278,6 @@ def read_pdf(path: Path) -> Book:
             if mono:
                 target = ET.SubElement(target, "code")
             markup.append_text(target, text)
-        _links(el, contents[pi])
     for di in sorted(docs):
         root, body = docs[di]
         book.add_document(f"text/part{di + 1:04d}.xhtml", root)
@@ -1047,8 +1314,3 @@ def read_pdf(path: Path) -> Book:
             book.metadata.title = "".join(t for t, *_ in h[1]).strip()[:200]
     return book
 
-
-def _links(el, pc: PageContent) -> None:
-    if not pc.links:
-        return
-    del el

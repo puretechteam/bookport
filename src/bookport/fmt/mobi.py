@@ -9,6 +9,7 @@ kindle:pos, kindle:embed and kindle:flow links resolved. Encrypted books raise D
 
 from __future__ import annotations
 
+import bisect
 import re
 import struct
 import xml.etree.ElementTree as ET
@@ -25,6 +26,7 @@ from ..palm import HuffCdic, palmdoc_decompress, read_pdb, trailing_size
 NULL = 0xFFFFFFFF
 
 NUMERIC_EXTH = {115, 116, 121, 125, 131, 201, 202, 203, 204, 205, 206, 207, 401, 403, 404, 405, 406}
+_UUID = re.compile(r"(urn:uuid:)?[0-9a-fA-F]{8}(-[0-9a-fA-F]{4}){3}-[0-9a-fA-F]{12}")
 
 LOCALES = {9: "en", 7: "de", 12: "fr", 10: "es", 16: "it", 19: "nl", 22: "pt", 25: "ru", 17: "ja", 4: "zh", 18: "ko",
            29: "sv", 20: "no", 6: "da", 11: "fi", 21: "pl", 5: "cs", 14: "hu", 31: "tr", 8: "el", 13: "he", 1: "ar"}
@@ -143,9 +145,16 @@ def _text(records: list[bytes], h: MobiHeader) -> bytes:
     else:
         raise BookportError(f"Unknown MOBI compression {h.compression}")
     parts = []
+    total = 0
     for r in recs:
         cut = trailing_size(r, h.extra_flags) if h.extra_flags else 0
-        parts.append(decomp(r[:len(r) - cut] if cut else r))
+        part = decomp(r[:len(r) - cut] if cut else r)
+        total += len(part)  # each HUFF record is capped, the whole text too: a 3 KB file could unpack to gigabytes
+        limits.grow(total)
+        limits.charge(len(part))
+        parts.append(part)
+        if h.text_length and total >= h.text_length:
+            break
     text = b"".join(parts)
     if h.text_length and len(text) > h.text_length:
         text = text[:h.text_length]
@@ -169,14 +178,17 @@ def _metadata(h: MobiHeader) -> Metadata:
     md.date = (ex.get(106) or [""])[0].strip()
     md.contributors = [c.strip() for c in ex.get(108, []) if c.strip() and "calibre" not in c.lower()]
     md.rights = (ex.get(109) or [""])[0].strip()
-    if ex.get(113):
-        md.identifiers["asin"] = ex[113][0].strip()
+    own = ""  # the book's own id, which bookport and calibre write as "name:id" and repeat as the ASIN
     if ex.get(112):
         src = ex[112][0].strip()
-        if src.lower().startswith("calibre:"):
-            md.identifiers.setdefault("uuid", src.split(":", 1)[1])
+        if src.lower().startswith(("calibre:", "bookport:")):
+            own = src.split(":", 1)[1]
+            if own not in md.identifiers.values():
+                md.identifiers.setdefault("uuid" if _UUID.fullmatch(own) else "id", own)
         elif src:
             md.identifiers.setdefault("source", src)
+    if ex.get(113) and ex[113][0].strip() != own:
+        md.identifiers["asin"] = ex[113][0].strip()
     md.language = (ex.get(524) or [""])[0].strip() or LOCALES.get(h.locale, "")
     return md
 
@@ -187,7 +199,7 @@ def read(path) -> Book:
 
 
 def from_bytes(data: bytes) -> Book:
-    if data[:4] == b"TPZ0" or data[:3] == b"TPZ":
+    if data[:3] == b"TPZ":
         raise BookportError("This is a Topaz Kindle book, which bookport can't read")
     if data[:8] == b"\xeaDRMION\xee":
         raise DRMError("Kindle KFX", "it is a KFX-ZIP book with DRM")
@@ -347,25 +359,28 @@ def _read_mobi6(records: list[bytes], h: MobiHeader) -> Book:
         pieces = [html]
     anchor_doc: dict[int, str] = {}
     head_html = b""
-    m = re.search(rb"<head[^>]*>(.*?)</head>", html, re.DOTALL | re.IGNORECASE)
+    m = re.search(rb"<head\b[^>]*>(.*?)</head>", html, re.DOTALL | re.IGNORECASE)
     if m:
         head_html = m.group(1)
     styles = b"".join(re.findall(rb"<style[^>]*>.*?</style>", head_html, re.DOTALL | re.IGNORECASE))
     docs = []
     for n, piece in enumerate(pieces, 1):
         href = f"text/part{n:04d}.xhtml"
-        piece = re.sub(rb"</?(html|body|head)[^>]*>", b"", piece, flags=re.IGNORECASE)
-        piece = re.sub(rb"<head[^>]*>.*?</head>", b"", piece, flags=re.DOTALL | re.IGNORECASE)
+        # the head as a whole first (stripping the tags first left its <link>s and text in the chapter);
+        # \b so that <header> stays
+        piece = re.sub(rb"<head\b[^>]*>.*?</head>", b"", piece, flags=re.DOTALL | re.IGNORECASE)
+        piece = re.sub(rb"</?(html|body|head)\b[^>]*>", b"", piece, flags=re.IGNORECASE)
         piece = re.sub(rb"<title>.*?</title>|<meta[^>]*>|<style[^>]*>.*?</style>", b"", piece, flags=re.DOTALL | re.IGNORECASE)
         for a in re.finditer(rb'id="filepos(\d+)"', piece):
             anchor_doc[int(a.group(1))] = href
         docs.append((href, piece))
     lang = book.metadata.language
+    anchors = sorted(anchor_doc)
     for href, piece in docs:
         src = (b'<html><head><meta charset="utf-8"/><title>' + markup.escape(book.metadata.title).encode("utf-8")
                + b"</title>" + styles + b"</head><body>" + piece + b"</body></html>")
         root = markup.parse(src.decode(h.encoding, "replace"))
-        _mobi6_fix(root, href, anchor_doc)
+        _mobi6_fix(root, href, anchor_doc, anchors)
         if lang:
             root.set("lang", lang)
         book.add_document(href, root)
@@ -373,8 +388,8 @@ def _read_mobi6(records: list[bytes], h: MobiHeader) -> Book:
     def target(pos):
         if pos in anchor_doc:
             return f"{anchor_doc[pos]}#filepos{pos}"
-        before = [p for p in anchor_doc if p <= pos]
-        return f"{anchor_doc[max(before)]}#filepos{max(before)}" if before else book.spine[0]
+        near = _anchor_before(anchors, pos)
+        return f"{anchor_doc[near]}#filepos{near}" if near is not None else book.spine[0]
 
     if toc_flat:
         book.toc = _toc_tree([(d, TocEntry(label, target(pos)), parent, pos) for d, label, pos, parent in toc_flat])
@@ -429,7 +444,13 @@ def _insert_anchors(text: bytes, positions) -> bytes:
     return b"".join(out)
 
 
-def _mobi6_fix(root: ET.Element, href: str, anchor_doc: dict) -> None:
+def _anchor_before(anchors: list[int], pos: int) -> int | None:
+    """The last anchor at or before ``pos`` (``anchors`` sorted), or None."""
+    k = bisect.bisect_right(anchors, pos)
+    return anchors[k - 1] if k else None
+
+
+def _mobi6_fix(root: ET.Element, href: str, anchor_doc: dict, anchors: list[int]) -> None:
     for el in root.iter():
         if el.tag == "a" and el.get("filepos") is not None:
             try:
@@ -438,9 +459,9 @@ def _mobi6_fix(root: ET.Element, href: str, anchor_doc: dict) -> None:
                 continue
             doc = anchor_doc.get(pos)
             if doc is None:
-                before = [p for p in anchor_doc if p <= pos]
-                if before:
-                    pos = max(before)
+                near = _anchor_before(anchors, pos)
+                if near is not None:
+                    pos = near
                     doc = anchor_doc[pos]
             if doc:
                 el.set("href", relative(href, f"{doc}#filepos{pos}"))
@@ -505,7 +526,7 @@ def _read_kf8(records: list[bytes], h: MobiHeader, h6: MobiHeader) -> Book:
     if book.cover is None and h6 is not h:
         _cover(book, h6, images)
     skel, _ = read_index(records, base + h.skel_index if h.skel_index != NULL else None, h.encoding)
-    frags, _frag_cncx = read_index(records, base + h.frag_index if h.frag_index != NULL else None, h.encoding)
+    frags, _cncx = read_index(records, base + h.frag_index if h.frag_index != NULL else None, h.encoding)
     raw = flows[0]
     files = []  # (number, start, html bytes, [(fragment number, absolute insert offset within file, length)])
     frag_i = 0
@@ -558,8 +579,6 @@ def _read_kf8(records: list[bytes], h: MobiHeader, h6: MobiHeader) -> Book:
         if 6 in tags and len(tags[6]) >= 2:
             nav_targets.append((tags[6][0], tags[6][1]))
     wanted: dict[int, set] = {}
-    for fdata in files:
-        pass
     all_pos = set(nav_targets)
     for fdata in files:
         for m in pos_re.finditer(fdata):

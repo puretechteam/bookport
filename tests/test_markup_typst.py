@@ -116,9 +116,10 @@ def test_reads_markup(tmp_path):
     assert "comment" not in text and "Text continues." in text
     assert root.find(".//sub").text == "2" and root.find(".//del").text == "gone"
     assert re.search(r"Lorem( \w+,?){11}", text)
-    # set and show rules stay as Typst, and the book says so
-    raw = [markup.text_of(p) for p in root.iter("pre") if p.get("data-format") == "typst"]
-    assert raw[0].startswith("#set document(") and "#set heading(numbering: \"1.\")" in raw
+    # set and show rules are dropped (the document's title and authors go to the metadata), and the book says so
+    assert not [p for p in root.iter("pre") if p.get("data-format") == "typst"]
+    assert "#set" not in text and "numbering" not in text
+    assert book.metadata.title == "A Typst sample" and book.metadata.authors == ["Ann", "Bo"]
     assert any("#set" in x for x in book.lost)
 
 
@@ -234,3 +235,26 @@ def test_call_stops_at_what_is_not_an_argument():
     from bookport.fmt.typst import _Reader
     reader = _Reader(Book(), None, None)
     assert "rest &amp; more" in reader._call("#strong(x) rest & more", False)
+
+
+def test_writing_and_reading_back_gains_no_code_block(tmp_path):
+    book = _read(tmp_path, '#set document(title: "A Typst sample", author: ("Ann", "Bo"))\n\n= Intro\nSome text.\n')
+    out = tmp_path / "out" / "again.typ"
+    out.parent.mkdir()
+    book.write(out)
+    assert out.read_text(encoding="utf-8").startswith("#set document(")  # the writer's own line
+    again = bookport.read(out)
+    assert not list(again.tree(again.spine[0]).iter("pre"))  # it came back as a title, not as a code block
+    assert again.metadata.title == "A Typst sample" and again.metadata.authors == ["Ann", "Bo"]
+
+
+def test_set_and_show_lines_are_dropped(tmp_path):
+    src = ('#set page(margin: 2cm)\n#show heading: set text(blue)\n#set document(title: "Kept", author: "Cy")\n'
+           '#set document(title: "Ignored")\n\n= Heading\nBody text.\n')
+    book = _read(tmp_path, src)
+    root = book.tree(book.spine[0])
+    assert not list(root.iter("pre"))
+    text = " ".join(markup.text_of(root).split())
+    assert "#set" not in text and "#show" not in text and "margin" not in text and "Body text." in text
+    assert book.metadata.title == "Kept" and book.metadata.authors == ["Cy"]
+    assert any("#show" in x for x in book.lost) and any("#set" in x for x in book.lost)

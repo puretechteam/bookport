@@ -46,12 +46,19 @@ def _encint(v: int) -> bytes:
     return bytes(reversed(out))
 
 
+def _small_number(v: str) -> bool:
+    """A plain number a token can hold ("²" passes isdigit() but isn't one)."""
+    return v.isascii() and v.isdigit() and int(v) < 0xFFFE
+
+
 class _Tokens:
     """Builds tokenized XML as a list of code points (encoded to UTF-8 at the end)."""
 
     def __init__(self):
         self.out: list[str] = []
         self.anchors: list[tuple[str, int]] = []
+        self._counted = 0  # pieces of out already in _bytes
+        self._bytes = 0
 
     def chars(self, s: str):
         self.out.append(s.replace("\x00", ""))
@@ -85,7 +92,12 @@ class _Tokens:
         self.out.append("\x00" + chr(flags) + "\x00")
 
     def size(self) -> int:
-        return len("".join(self.out).encode("utf-8", "surrogatepass"))
+        """Bytes so far, counting only what was added since the last call (an id in every paragraph made
+        writing quadratic: 4,000 ids took 1.9 s)."""
+        new = self.out[self._counted:]
+        self._bytes += sum(len(s.encode("utf-8", "surrogatepass")) for s in new)
+        self._counted = len(self.out)
+        return self._bytes
 
     def data(self) -> bytes:
         return "".join(self.out).encode("utf-8", "surrogatepass")
@@ -162,9 +174,9 @@ class _Writer:
                         attrs.append((0x3EE, target))
                 elif tag == "link" and k in ("rel", "type"):
                     attrs.append((0x3EF if k == "rel" else 0x3F1, v))
-                elif tag in ("td", "th") and k in ("colspan", "rowspan") and v.isdigit():
+                elif tag in ("td", "th") and k in ("colspan", "rowspan") and _small_number(v):
                     attrs.append((0x7D3 if k == "colspan" else 0x7D2, int(v)))
-                elif tag == "li" and k == "value" and v.isdigit():
+                elif tag == "li" and k == "value" and _small_number(v):
                     attrs.append((0x3EA, int(v)))
                 elif k in ("style", "width", "height", "start", "type", "name", "colspan", "rowspan", "align"):
                     attrs.append((k, v))

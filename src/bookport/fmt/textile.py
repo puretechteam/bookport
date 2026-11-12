@@ -21,7 +21,9 @@ from .mediawiki import attr, clean_input, esc, html_book, local_picture, note_as
 
 MAX_NEST = 16
 
-_ATTRS = r"(?:\([^()\n]{0,80}\)|\{[^{}\n]{0,200}\}|\[[^\[\]\n]{0,40}\]|<>|[<>=~^-]|\(+|\)+){0,8}"
+# one way only to match any run of marks (_parse_attrs reads them afterwards): "(+", "<>" and "()" next
+# to single marks could split a run of "(" so many ways that 50 of them took minutes
+_ATTRS = r"(?:\([^()\n]{1,80}\)|\{[^{}\n]{0,200}\}|\[[^\[\]\n]{0,40}\]|[<>=~^()-]){0,16}"
 _SIG = re.compile(rf"^(h[1-6]|p|bq|bc|pre|fn\d{{1,4}}\^?|###|notextile|clear|div)({_ATTRS})(\.\.?)(?::(\S+))?(?: (.*)|$)")
 _INLINE_ATTRS = r"(?:\([^()\s][^()\n]{0,80}\)|\{[^{}\n]{0,200}\}|\[[^\[\]\n]{0,40}\]){0,3}"
 _TAGS_ONLY = re.compile(r"^\s*(?:</?(?:div|section|aside|article|header|footer|nav|main|figure|figcaption|table|thead|"
@@ -283,7 +285,8 @@ class _Textile:
             row = []
             all_head = True
             for cell in cells:
-                cm = re.match(r"^((?:_|\\\d+|/\d+|[<>=^~]|<>|\([^()]*\)|\{[^{}]*\}|\[[^\[\]]*\])*)\. (.*)$", cell, re.DOTALL)
+                # "<>" is two marks here (found again below): as its own choice too, 26 of them took 17 s
+                cm = re.match(r"^((?:_|\\\d+|/\d+|[<>=^~]|\([^()]*\)|\{[^{}]*\}|\[[^\[\]]*\])*)\. (.*)$", cell, re.DOTALL)
                 spec, content = (cm.group(1), cm.group(2)) if cm else ("", cell)
                 head = "_" in spec
                 all_head &= head

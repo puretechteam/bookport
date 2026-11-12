@@ -168,6 +168,7 @@ class _Converter:
         self.toc: list[TocEntry] = []
         self.ids: dict[str, str] = {}  # fb2 id -> document href
         self.n = 0
+        self.sections = 0
         self.css_href = book.add("styles/fb2.css", FB2_CSS, "text/css").href
 
     def new_doc(self):
@@ -217,8 +218,13 @@ class _Converter:
             if child.tag == "title":
                 h = ET.SubElement(div, f"h{min(depth, 6)}")
                 if not div.get("id"):
-                    div.set("id", f"s{len(self.ids) + id(div) % 100000}")
-                    self.ids[div.get("id")] = href
+                    self.sections += 1  # numbered, so the same book gives the same file every time
+                    sid = f"bp-section-{self.sections}"
+                    while sid in self.ids:
+                        self.sections += 1
+                        sid = f"bp-section-{self.sections}"
+                    div.set("id", sid)
+                    self.ids[sid] = href
                 first = True
                 for p in child:
                     if p.tag == "p":
@@ -416,7 +422,7 @@ h1, h2, h3, h4, h5, h6 { text-align: center; text-indent: 0 }
 class _Writer:
     def __init__(self, book: Book):
         self.book = book
-        self.binaries: dict[str, tuple[str, str]] = {}  # href -> (id, content type)
+        self.binaries: dict[str, tuple[str, str, bytes]] = {}  # href -> (id, content type, bytes)
         self.anchor_ids: dict[str, str] = {}
         self.targets = self._link_targets()
 
@@ -447,15 +453,14 @@ class _Writer:
                 converted = to_png(data)
                 if converted is None:
                     return None
-                data, mt = converted, "image/png"
-                self.book.resources[href] = type(res)(res.href, mt, data)
+                data, mt = converted, "image/png"  # kept here: the caller's book is left as it was
             base = re.sub(r"[^\w.-]", "_", href.split("/")[-1])
             if mt == "image/png" and not base.lower().endswith(".png"):
                 base = base.rsplit(".", 1)[0] + ".png"
             bid = base if not base[0].isdigit() else "img" + base
             while bid in {v[0] for v in self.binaries.values()}:
                 bid = f"{len(self.binaries)}_{bid}"
-            self.binaries[href] = (bid, mt)
+            self.binaries[href] = (bid, mt, data)
         return self.binaries[href][0]
 
 
@@ -522,8 +527,7 @@ def to_bytes(book: Book) -> bytes:
     out.append(f"<title><p>{esc(md.title or 'Untitled')}</p></title>\n")
     out.append(_sections(blocks, w, book))
     out.append("</body>\n")
-    for href, (bid, mt) in w.binaries.items():
-        data = book.resources[href].data
+    for bid, mt, data in w.binaries.values():
         out.append(f'<binary id="{markup._esc_attr(bid)}" content-type="{mt}">')
         b64 = base64.b64encode(data).decode("ascii")
         out.append("\n".join(b64[i:i + 76] for i in range(0, len(b64), 76)))

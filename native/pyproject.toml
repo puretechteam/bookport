@@ -4,7 +4,7 @@ build-backend = "maturin"
 
 [project]
 name = "bookport-native"
-version = "0.3.0"
+version = "0.4.0"
 description = "Compiled DjVu decoders for bookport: the same results, much faster. Optional: bookport works without them."
 license = "MIT"
 authors = [{ name = "Pure Tech" }]

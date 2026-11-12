@@ -708,3 +708,108 @@ def test_unknown_write_options_are_refused(book, tmp_path):
     book.write(tmp_path / "a.pdf", page_size="a4", text_size="large")
     book.write(tmp_path / "b.epub", version=2)
     book.write(tmp_path / "a.pdb", format="ztxt")
+
+
+# --- the 1.5 audit: decoders whose output wasn't tied to the limits ----------------------------
+
+def _huff_mobi_records(text_records: int):
+    """HUFF/CDIC records where each one-byte text record unpacks to 1,024,000 bytes (under the
+    1 MB per-record cap): phrase 0 is 32,000 'A's, phrase 1 is 32 codes for phrase 0."""
+    dict1 = struct.pack(">256I", *[(255 << 8) | 0x80 | 8] * 256)  # 8-bit codes; byte c is phrase 255 - c
+    huff = b"HUFF" + struct.pack(">IIIII", 24, 24, 24 + 1024, 0, 0) + dict1 + bytes(256)
+    phrases = [struct.pack(">H", 0x8000 | 32000) + b"A" * 32000, struct.pack(">H", 32) + b"\xff" * 32]
+    offs = struct.pack(">HH", 4, 4 + len(phrases[0]))
+    cdic = b"CDIC" + struct.pack(">III", 16, 2, 8) + offs + b"".join(phrases)
+    return [b"\xfe"] * text_records + [huff, cdic]
+
+
+def test_mobi_huff_text_counts_against_the_limits(small_limits):
+    """Each HUFF record was capped at 1 MB but the text as a whole wasn't: 20 one-byte records
+    unpacked to 20 MB with 1 MB allowed per part."""
+    from bookport.fmt import mobi
+    h = types.SimpleNamespace(encryption=0, version=6, offset=-1, text_records=20, compression=17480,
+                              huff_offset=21, huff_count=2, extra_flags=0, text_length=0)
+    with pytest.raises(BookportError, match="unpacks to more than"):
+        mobi._text(_huff_mobi_records(20), h)
+    h.text_records = 1  # one record is still fine
+    assert len(mobi._text(_huff_mobi_records(20), h)) == 1_024_000
+
+
+def test_mobi_index_entry_past_its_bytes_stops():
+    """A count that runs past the entry's bytes used to add zeros for ever (16,320 values from 1 byte here)."""
+    from bookport import mobi_index
+    tagx = [(t, 255, 0xFE, 0) for t in range(1, 65)]
+    got = mobi_index._entry_tags(bytes([0x02]), 0, 1, tagx)
+    assert sum(len(v) for v in got.values()) == 0
+
+
+def test_tcr_bomb(tmp_path, small_limits):
+    """Each TCR byte stands for up to 255 bytes: 200 KB read as 48 MB with 1 MB allowed per part."""
+    entries = [bytes([255]) + b"x" * 255] + [b"\x00"] * 255
+    p = tmp_path / "bomb.tcr"
+    p.write_bytes(b"!!8-Bit!!" + b"".join(entries) + b"\x00" * 200_000)
+    with pytest.raises(BookportError, match="unpacks to more than"):
+        bookport.read(p)
+
+
+def _lrf(objects: dict[int, tuple[int, bytes]]) -> bytes:
+    """A bare LRF: no info block, no page tree (pages are found by type), objects as given."""
+    def obj(oid, otype, data):
+        return (struct.pack("<HIH", 0xF500, oid, otype) + struct.pack("<HH", 0xF554, 0)
+                + struct.pack("<HI", 0xF504, len(data)) + struct.pack("<H", 0xF505) + data + struct.pack("<H", 0xF501))
+    head = bytearray(0x58)
+    head[:8] = lrf_signature()
+    body, index = bytearray(), []
+    for oid, (otype, data) in objects.items():
+        chunk = obj(oid, otype, data)
+        index.append(struct.pack("<IIII", oid, len(head) + len(body), len(chunk), 0))
+        body += chunk
+    struct.pack_into("<IQQ", head, 12, 0, len(objects), len(head) + len(body))
+    return bytes(head + body) + b"".join(index)
+
+
+def lrf_signature():
+    from bookport.fmt import lrf
+    return lrf.SIGNATURE
+
+
+def test_lrf_text_linked_many_times_is_read_once(tmp_path):
+    """A page that links one text block 3,000 times gave 3,000 copies of its text (a 20 KB file
+    could grow to gigabytes of document)."""
+    words = "A paragraph of words. " * 500
+    text = (struct.pack("<HI", 0xF5A1, 0) + struct.pack("<HH", 0xF5CC, len(words) * 2) + words.encode("utf-16-le")
+            + struct.pack("<H", 0xF5A2))
+    page = struct.pack("<HI", 0xF503, 2) * 3000
+    p = tmp_path / "many.lrf"
+    p.write_bytes(_lrf({1: (0x02, page), 2: (0x0A, text)}))
+    book = bookport.read(p)
+    assert book.text().count("A paragraph of words.") == 500
+
+
+def test_htmlz_pictures_with_clashing_names_dont_hang(tmp_path):
+    """images/x.png, images/b/2_x.png and images/c/x.png, used in that order, made the HTMLZ
+    writer try the same name for ever."""
+    import threading
+    import xml.etree.ElementTree as ET
+    book = bookport.Book(bookport.Metadata(title="Clash"))
+    hrefs = ["images/x.png", "images/b/2_x.png", "images/c/x.png"]
+    for n, h in enumerate(hrefs):
+        book.add(h, png(5 + n, 5))
+    root, body = markup.new_document("Clash", "en")
+    for h in hrefs:
+        ET.SubElement(body, "img", {"src": "../" + h, "alt": ""})
+    book.add_document("text/a.xhtml", root)
+    out = tmp_path / "c.htmlz"
+    t = threading.Thread(target=book.write, args=(out,), daemon=True)
+    t.start()
+    t.join(20)
+    assert not t.is_alive()
+    with zipfile.ZipFile(out) as z:
+        pics = sorted(n for n in z.namelist() if n.startswith("images/"))
+    assert len(pics) == 3
+
+
+def test_a_zip_with_a_file_where_a_folder_goes_is_damage(tmp_path):
+    p = _zip(tmp_path / "x.htmlz", {"a": b"x", "a/index.html": b"<html><body><p>Hi</p></body></html>"})
+    with pytest.raises(BookportError):
+        bookport.read(p)

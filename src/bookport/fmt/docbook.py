@@ -589,11 +589,16 @@ class _Reader:
         eid = _id(el)
         if tag in ("variablelist", "glosslist", "qandaset", "qandadiv", "segmentedlist"):
             dl = ET.SubElement(out, "dl")
+            dls = [dl]
             if eid:
                 dl.set("id", eid)
             for entry in el:
                 kind = local(entry)
-                if kind == "varlistentry":
+                if kind == "qandadiv":  # a group of questions with its own title: its entries, then on
+                    self.list(entry, out, level, depth + 1)
+                    dl = ET.SubElement(out, "dl")
+                    dls.append(dl)
+                elif kind == "varlistentry":
                     dt = ET.SubElement(dl, "dt")
                     terms = entry.findall("term")
                     for k, term in enumerate(terms):
@@ -606,7 +611,7 @@ class _Reader:
                         self.children(item, ET.SubElement(dl, "dd"), level)
                 elif kind == "glossentry":
                     self.glossentry(entry, dl)
-                elif kind in ("qandaentry", "qandadiv"):
+                elif kind == "qandaentry":
                     q, a = entry.find("question"), entry.find("answer")
                     if q is not None:
                         dt = ET.SubElement(dl, "dt")
@@ -620,6 +625,9 @@ class _Reader:
                         dt.text = titles[k] if k < len(titles) else ""
                         dd = ET.SubElement(dl, "dd")
                         self.inline_children(seg, dd)
+            for d in dls:
+                if not len(d) and not d.get("id"):
+                    out.remove(d)
             return
         if tag == "simplelist":
             members = el.findall("member")
@@ -639,7 +647,7 @@ class _Reader:
         if eid:
             lst.set("id", eid)
         start = el.get("startingnumber", "")
-        if ordered and start.isdigit() and start != "1":
+        if ordered and start.isdecimal() and start != "1":
             lst.set("start", start)
         for item in el:
             if local(item) in ("listitem", "step", "callout", "biblioentry", "bibliomixed"):
@@ -717,7 +725,7 @@ class _Reader:
             cols: dict[str, int] = {}
             n = 0
             for spec in group.findall("colspec"):
-                n = int(spec.get("colnum")) if (spec.get("colnum") or "").isdigit() else n + 1
+                n = markup.whole(spec.get("colnum")) or n + 1
                 if spec.get("colname"):
                     cols[spec.get("colname", "")] = n
             spans = {s.get("spanname", ""): (s.get("namest", ""), s.get("nameend", "")) for s in group.findall("spanspec")}
@@ -738,8 +746,8 @@ class _Reader:
                         if st in cols and en in cols and cols[en] > cols[st]:
                             cell.set("colspan", str(min(cols[en] - cols[st] + 1, 50)))
                         more = entry.get("morerows", "")
-                        if more.isdigit() and int(more) > 0:
-                            cell.set("rowspan", str(min(int(more) + 1, 500)))
+                        if (markup.whole(more) or 0) > 0:
+                            cell.set("rowspan", str(min(markup.whole(more) + 1, 500)))
                         align = entry.get("align", "")
                         if align in ("left", "right", "center", "justify"):
                             cell.set("style", f"text-align: {align}")
@@ -754,7 +762,7 @@ class _Reader:
             if local(c) in ("td", "th"):
                 cell = ET.SubElement(row, local(c))
                 for a in ("colspan", "rowspan"):
-                    if (c.get(a) or "").isdigit():
+                    if (c.get(a) or "").isdecimal():
                         cell.set(a, c.get(a, ""))
                 self.cell(c, cell)
 
@@ -1191,6 +1199,7 @@ class _Writer(TextWriter):
 
     def _mathml(self, el: ET.Element) -> str:
         m = copy.deepcopy(el)
+        m.tail = None  # the text after the equation is written after it, once
         for node in m.iter():
             if isinstance(node.tag, str):
                 node.tag = "mml:" + node.tag

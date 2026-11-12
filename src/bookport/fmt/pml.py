@@ -26,6 +26,35 @@ _TOKEN = re.compile(r'\\(?:(X[0-4])|(C[0-4])="([^"]*)"|(Sp|Sb|Sd|Fn)(?:="([^"]*)
 
 # --- reading -----------------------------------------------------------------------------------
 
+def _plain(s: str) -> str:
+    """Text with its character codes turned into characters and every other code dropped (for note bodies)."""
+    out, pos, high = [], 0, None
+    for m in _TOKEN.finditer(s):
+        out.append(s[pos:m.start()])
+        pos = m.end()
+        g = m.groups()
+        if g[7]:
+            try:
+                out.append(bytes([int(g[8])]).decode("cp1252"))
+            except (ValueError, UnicodeDecodeError):
+                pass
+        elif g[9]:
+            cp = int(g[10], 16)
+            if 0xD800 <= cp < 0xDC00:
+                high = cp
+                continue
+            if 0xDC00 <= cp < 0xE000:
+                if high is not None:
+                    out.append(chr(0x10000 + ((high - 0xD800) << 10) + (cp - 0xDC00)))
+            else:
+                out.append(chr(cp))
+        elif g[11] == "\\":
+            out.append("\\")
+        high = None
+    out.append(s[pos:])
+    return "".join(out)
+
+
 def read(path) -> Book:
     p = Path(path)
     data = p.read_bytes()
@@ -167,8 +196,11 @@ class _Converter:
 
         pos = 0
         last_anchor = [-1, ""]
+        high = None  # the first half of a surrogate pair: \U has 4 digits, so an emoji is \UD83D\UDE00
         for m in _TOKEN.finditer(text):
             chunk = text[pos:m.start()]
+            if chunk or not m.group(10):
+                high = None
             pos = m.end()
             self._text_lines(chunk, add_text, end_para if heading is None else (lambda: add_text(" ")))
             x_level, c_level, c_title, s_code, s_arg, k_code, k_arg, a_code, a_num, u_code, u_hex, simple = m.groups()
@@ -234,7 +266,15 @@ class _Converter:
                     pass
                 continue
             if u_code:
-                add_text(chr(int(u_hex, 16)))
+                cp = int(u_hex, 16)
+                if 0xD800 <= cp < 0xDC00:
+                    high = cp
+                elif 0xDC00 <= cp < 0xE000:
+                    if high is not None:
+                        add_text(chr(0x10000 + ((high - 0xD800) << 10) + (cp - 0xDC00)))
+                    high = None  # a lone half is dropped: it isn't a character
+                else:
+                    add_text(chr(cp))
                 continue
             if simple == "p":
                 end_para()
@@ -262,7 +302,7 @@ class _Converter:
             for kind, nid, content in notes:
                 aside = ET.SubElement(body, "aside", {"id": f"note_{_safe(nid)}", "epub:type": kind.lower()})
                 p = ET.SubElement(aside, "p")
-                p.text = re.sub(r"\\.", "", " ".join(content.split()))
+                p.text = _plain(" ".join(content.split()))
             self.docs.append((root, body))
 
     def _has_content(self):
@@ -339,7 +379,12 @@ def _esc(text: str, ascii_only: bool) -> str:
                 b = ch.encode("cp1252")
                 out.append(f"\\a{b[0]:03d}")
             except UnicodeEncodeError:
-                out.append(f"\\U{ord(ch):04X}" if ord(ch) < 0x10000 else "?")
+                n = ord(ch)
+                if n < 0x10000:
+                    out.append(f"\\U{n:04X}")
+                else:  # \U takes 4 digits: past them, a surrogate pair
+                    n -= 0x10000
+                    out.append(f"\\U{0xD800 + (n >> 10):04X}\\U{0xDC00 + (n & 0x3FF):04X}")
     return "".join(out)
 
 

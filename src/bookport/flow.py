@@ -13,6 +13,7 @@ from dataclasses import dataclass, field, replace
 
 from . import css as cssmod
 from .book import Book, is_external, resolve
+from .textwriter import number, table_rows
 
 _WS = re.compile(r"[ \t\n\r\f]+")
 _INVISIBLE = re.compile("[­\u200b⁠﻿]")
@@ -100,6 +101,8 @@ ROMAN = [(1000, "m"), (900, "cm"), (500, "d"), (400, "cd"), (100, "c"), (90, "xc
 
 
 def roman(n: int) -> str:
+    if not 0 < n < 4000:  # as CSS does: out of the range Roman numerals cover, the number in digits
+        return str(n)
     out = []
     for v, s in ROMAN:
         while n >= v:
@@ -386,14 +389,12 @@ class _Walker:
                 kind = {"1": "decimal", "a": "lower-alpha", "A": "upper-alpha", "i": "lower-roman",
                         "I": "upper-roman"}.get(el.get("type"), kind)
             sub["list_type"] = kind
-            start = el.get("start", "")
-            sub["list_start"] = int(start) if tag == "ol" and start.lstrip("-").isdigit() else 1
+            sub["list_start"] = number(el.get("start"), 1, -10**9, 10**9) if tag == "ol" else 1
             sub["role"] = ""
         if tag in ("ul", "ol", "dl", "menu", "dir"):
             sub["depth"] = ctx.get("depth", 0) + 1
             if tag == "ol":
-                start = el.get("start")
-                sub["counter"] = (int(start) - 1) if start and start.lstrip("-").isdigit() else 0
+                sub["counter"] = number(el.get("start"), 1, -10**9, 10**9) - 1
             else:
                 sub["counter"] = 0
             self._list_counters = getattr(self, "_list_counters", {})
@@ -434,8 +435,8 @@ class _Walker:
         parent = self._parent(el)
         counters = getattr(self, "_list_counters", {})
         if parent is not None and parent in counters:
-            if el.get("value", "").isdigit():
-                counters[parent] = int(el.get("value")) - 1
+            if el.get("value"):
+                counters[parent] = number(el.get("value"), counters[parent] + 1, -10**9, 10**9) - 1
             counters[parent] += 1
             n = counters[parent]
         else:
@@ -473,7 +474,7 @@ class _Walker:
         caption = table.find("caption")
         if caption is not None:
             self._block(caption, self.styles.get(caption, {}), Run(), ctx, "block", False)
-        for tr in table.iter("tr"):
+        for tr in table_rows(table):  # a table inside a cell is that cell's text, not more rows of this one
             row = []
             for cell in tr:
                 if cell.tag not in ("td", "th"):
@@ -489,16 +490,18 @@ class _Walker:
                 del self.blocks[saved_blocks:]
                 runs = []
                 for b in inner:
+                    if b.kind == "table":
+                        for r in b.rows:
+                            for k, c in enumerate(r):
+                                runs.extend(([Run(text=" ")] if k else []) + c.runs)
+                            runs.append(Run(text="\n"))
+                        continue
                     runs.extend(b.runs)
                     runs.append(Run(text="\n"))
                 runs.extend(self.cur)
                 self.cur = saved
-                span = cell.get("colspan", "1")
-                rspan = cell.get("rowspan", "1")
-                row.append(Cell(_trim(runs), header=cell.tag == "th",
-                                colspan=int(span) if span.isdigit() else 1,
-                                rowspan=int(rspan) if rspan.isdigit() else 1,
-                                align=st.get("text-align", "")))
+                row.append(Cell(_trim(runs), header=cell.tag == "th", colspan=number(cell.get("colspan"), 1, 1, 1000),
+                                rowspan=number(cell.get("rowspan"), 1, 1, 65534), align=st.get("text-align", "")))
             if row:
                 rows.append(row)
         if rows:

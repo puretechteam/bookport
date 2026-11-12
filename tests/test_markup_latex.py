@@ -243,8 +243,38 @@ def test_figures_pictures_and_subfigures(tmp_path):
     assert [_text(s.find("figcaption")) for s in subs] == ["(a) Left", "(b) Right"]
     assert _text(figs[1].findall("figcaption")[-1]) == "Figure 2: Both."
     assert [_text(a) for a in body.iter("a") if a.get("class") == "ref"] == ["1", "2a"]
-    assert any("PDF or EPS" in line and "vec.pdf" in line for line in book.lost)
+    assert any("PDF form" in line and "vec.pdf" in line for line in book.lost)
     assert any("not found" in line and "nothere" in line for line in book.lost)
+
+
+EPS = (b"%!PS-Adobe-3.0 EPSF-3.0\n%%BoundingBox: 0 0 200 100\n%%EndComments\n"
+       b"1 0 0 setrgbcolor 10 10 180 80 rectfill 0 setgray /Helvetica findfont 20 scalefont setfont "
+       b"20 40 moveto (Plot) show\n%%EOF\n")
+
+
+def test_eps_figures_become_svg_in_the_epub(tmp_path):
+    import zipfile
+    book = _read(tmp_path, _doc(
+        "\\begin{figure}\\includegraphics[width=0.5\\linewidth]{plot}\\caption{A plot.}\\end{figure}"
+        "\\begin{figure}\\epsfig{file=broken.eps}\\caption{Broken.}\\end{figure}"),
+        **{"plot.eps": EPS, "broken.eps": b"%!PS-Adobe-3.0 EPSF-3.0\n%%BoundingBox: 0 0 9 9\nnosuchop\n"})
+    imgs = list(_body(book).iter("img"))
+    assert imgs[0].get("src") == "../images/plot.svg" and imgs[0].get("style") == "width: 50%"
+    res = book.resources["images/plot.svg"]
+    assert res.media_type == "image/svg+xml"
+    root = ET.fromstring(res.data)
+    assert root.get("viewBox") == "0 0 200 100" and b'fill="#ff0000"' in res.data and b">Plot</text>" in res.data
+    assert any("plot.eps" in line and "Helvetica" in line for line in book.lost)  # its standard font, noted
+    assert any("broken.eps couldn't be drawn" in line for line in book.lost)
+    assert imgs[1].get("alt") == "broken.eps"  # its place kept
+    out = book.write(tmp_path / "paper.epub")
+    with zipfile.ZipFile(out) as z:
+        svgs = [n for n in z.namelist() if n.endswith("plot.svg")]
+        assert svgs and z.read(svgs[0]) == res.data
+        opf = next(z.read(n).decode() for n in z.namelist() if n.endswith(".opf"))
+        assert 'media-type="image/svg+xml"' in opf
+        pages = "".join(z.read(n).decode() for n in z.namelist() if n.endswith((".xhtml", ".html")))
+        assert "plot.svg" in pages
 
 
 def test_theorems_proofs_footnotes_and_quotes(tmp_path):
@@ -380,7 +410,7 @@ def _balanced(text: str) -> bool:
 def test_escaping():
     assert latex.escape("# $ % & _ { } ~ ^ \\ <x> [y] a--b ``q''") == (
         "\\# \\$ \\% \\& \\_ \\{ \\} \\textasciitilde{} \\textasciicircum{} \\textbackslash{} "
-        "\\textless{}x\\textgreater{} {[}y{]} a-{}-b `{}`q'{}'")
+        "\\textless{}x\\textgreater{} {[}y{]} a-{}-b \\textasciigrave{}\\textasciigrave{}q'{}'")  # a backtick, not a quote
     assert latex.escape("α ≤ β\u00a0x™") == "α ≤ β~x\\texttrademark{}"
 
 

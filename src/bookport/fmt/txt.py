@@ -25,7 +25,8 @@ def looks_like_markdown(text: str) -> bool:
     # (asterisk rules and bullets are common in plain text, e.g. "*** START ***" or "* * *")
     score = 0
     score += sum(1 for line in lines if re.match(r"^#{1,6}\s+\S", line)) * 3
-    score += len(re.findall(r"\[[^\]\n]+\]\([^)\s]+\)", sample)) * 2
+    # neither part may hold a bracket: each "[" then ends its look at the next one, not at the end of the text
+    score += len(re.findall(r"\[[^\[\]\n]+\]\([^()\[\]\s]+\)", sample)) * 2
     score += len(re.findall(r"^```", sample, re.MULTILINE)) * 3
     return score >= max(6, len(lines) // 300)
 
@@ -227,7 +228,7 @@ def block_text(b) -> str:
         return "* * *"
     if b.kind == "image":
         return f"[{b.alt}]" if b.alt and not b.alt.lower().startswith("cover") else ""
-    text = "".join(r.text if not r.image else (f"[{''}]" if False else "") for r in b.runs)
+    text = "".join(r.text for r in b.runs if not r.image)
     if b.kind != "pre":
         text = "\n".join(line.strip() for line in text.split("\n"))
     prefix = ""

@@ -23,7 +23,7 @@ from pathlib import Path
 from .. import flow as flowmod
 from ..book import Book, is_external
 from ..errors import BookportError
-from . import ttf
+from . import textlayer, ttf
 from .objects import Name, Ref, Writer
 
 PAGE_SIZES = {"phone": (252.0, 448.0), "ereader": (259.0, 346.0), "a5": (419.53, 595.28), "a4": (595.28, 841.89),
@@ -261,8 +261,9 @@ class Typesetter:
                     continue
                 if part[0] in " \t":
                     slot = self.fonts.get(style)
-                    w = slot.font.width(" ", rsize) * len(part.replace("\t", "    "))
-                    out.append(Item("space", " ", slot, rsize, w, rise, color, r.underline, r.strike, href, anchors))
+                    spaces = part.replace("\t", "    ")  # drawn as wide as it's measured: every space of the run
+                    w = slot.font.width(" ", rsize) * len(spaces)
+                    out.append(Item("space", spaces, slot, rsize, w, rise, color, r.underline, r.strike, href, anchors))
                     continue
                 # split by the font that has each character
                 seg = ""
@@ -293,8 +294,10 @@ class Typesetter:
                     hpt * scale)
 
     # --- line breaking ---------------------------------------------------------------------------
-    def lines(self, items: list[Item], width: float, indent: float = 0.0, hang: float = 0.0) -> list[Line]:
-        """Greedy line breaking; ``indent`` applies to the first line, ``hang`` to the rest."""
+    def lines(self, items: list[Item], width: float, indent: float = 0.0, hang: float = 0.0,
+              keep_spaces: bool = False) -> list[Line]:
+        """Greedy line breaking; ``indent`` applies to the first line, ``hang`` to the rest. ``keep_spaces``
+        (preformatted text): spaces at the start of a line are kept, as its indent."""
         words: list[tuple[list[Item], float, Item | None]] = []
         cur: list[Item] = []
         cur_w = 0.0
@@ -402,6 +405,10 @@ class Typesetter:
                         line.append(Item("text", "", self.fonts.get("regular"), self.base, 0, anchors=after.anchors))
                     finish(True)
                     pending_space = None
+                elif keep_spaces and not line:
+                    line.append(after)
+                    line_w += after.width
+                    pending_space = None
                 else:
                     pending_space = after if line else None
                     if not line and after.anchors:
@@ -473,7 +480,7 @@ class Typesetter:
                     text_ops.append(b"1 0 0 1 %s %s Tm\n" % (_fmt(x), _fmt(baseline)))
                     state["placed"] = True
                 glyphs = self.encode(it.slot, it.text)
-                kerned = self.kerned(it.slot.font, it.text, glyphs) if len(it.text) > 1 else None
+                kerned = self.kerned(it.slot.font, it.text, glyphs) if len(it.text) > 1 and it.kind != "space" else None
                 for part in kerned or (b"<" + glyphs + b">",):
                     if part[:1] == b"<" and tj and tj[-1][:1] == b"<":
                         tj[-1] = tj[-1][:-1] + part[1:]  # one string for a run of glyphs with no kern between
@@ -541,7 +548,7 @@ class Typesetter:
                 self.anchors.setdefault(a, (len(self.pages) - 1, self.y))
             return
         indent = b.indent * size if b.kind == "p" and b.indent > 0 else 0.0
-        lines = self.lines(items, width, indent=indent)
+        lines = self.lines(items, width, indent=indent, keep_spaces=b.kind == "pre")
         lh = b.line_height if 1.0 <= (b.line_height or 0) <= 2.5 else (1.2 if b.kind == "h" else 1.38)
         align = {"justify": "justify", "center": "center", "right": "right"}.get(b.align, "left")
         if b.kind == "pre":
@@ -554,7 +561,7 @@ class Typesetter:
             self.anchors.setdefault(a, (len(self.pages) - 1, self.y))
         for k, line in enumerate(lines):
             height = max(line.ascent + line.descent, (line.ascent + line.descent) * lh / 1.25)
-            if height > self.room():
+            if height > self.room() and self.y < self.ph - self.mt - 1:
                 self.new_page()
             baseline = self.y - line.ascent - (height - line.ascent - line.descent) / 2
             self.draw_line(line, x0, width, align, baseline)
@@ -563,11 +570,20 @@ class Typesetter:
     def list_marker(self, b, size, x0):
         if not b.marker:
             return
-        slot = self.fonts.get("regular")
-        w = slot.font.width(b.marker, size)
+        parts: list[tuple[Slot, str]] = []  # the marker in the fonts that have its characters (Noto Serif has no ◦ or ▪)
+        for ch in b.marker:
+            slot = self.fonts.for_char(ch, "regular")
+            if parts and parts[-1][0] is slot:
+                parts[-1] = (slot, parts[-1][1] + ch)
+            else:
+                parts.append((slot, ch))
+        w = sum(slot.font.width(text, size) for slot, text in parts)
         baseline = self.y - size * 0.95 - size * 0.1
-        self.page.ops.append(b"BT /%s %s Tf 1 0 0 1 %s %s Tm <%s> Tj ET\n" % (
-            slot.name.encode(), _fmt(size), _fmt(x0 - w - size * 0.4), _fmt(baseline), self.encode(slot, b.marker)))
+        x = x0 - w - size * 0.4
+        for slot, text in parts:
+            self.page.ops.append(b"BT /%s %s Tf 1 0 0 1 %s %s Tm <%s> Tj ET\n" % (
+                slot.name.encode(), _fmt(size), _fmt(x), _fmt(baseline), self.encode(slot, text)))
+            x += slot.font.width(text, size)
 
     def image_block(self, b: flowmod.Block):
         info = self.image(b.image)
@@ -663,6 +679,10 @@ class Typesetter:
             pending = [list(lines) for _c, lines, _col, _w in laid]
             while True:
                 room = self.room() - 2 * pad
+                firsts = [(p[0].ascent + p[0].descent) * 1.1 for p in pending if p]
+                if firsts and min(firsts) > room and self.y < self.ph - self.mt - 1:
+                    self.new_page()  # not even one line of the row fits what's left of this page
+                    continue
                 top = self.y
                 slice_h = 0.0
                 for k, (c, _lines, col, w) in enumerate(laid):
@@ -772,6 +792,8 @@ class Typesetter:
         md = self.book.metadata
         catalog = w.reserve()
         pages_ref = w.reserve()
+        num_slot = self.fonts.get("regular")
+        numbers = {i: self.encode(num_slot, str(page.number)) for i, page in enumerate(self.pages) if page.number}
         font_refs = {}
         for slot in self.fonts.slots.values():
             if slot.used:
@@ -786,7 +808,6 @@ class Typesetter:
                      "XObject": {info[0]: info[1] for info in self.images.values() if info is not None},
                      "ProcSet": [Name("PDF"), Name("Text"), Name("ImageC"), Name("ImageB")]}
         res_ref = w.add(resources)
-        num_slot = self.fonts.get("regular")
         for i, page in enumerate(self.pages):
             ops = list(page.ops)
             if page.number:
@@ -794,7 +815,7 @@ class Typesetter:
                 size = self.base * 0.72
                 x = (self.pw - num_slot.font.width(label, size)) / 2
                 ops.append(b"BT /%s %s Tf 0.35 g 1 0 0 1 %s %s Tm <%s> Tj 0 g ET\n" % (
-                    num_slot.name.encode(), _fmt(size), _fmt(x), _fmt(self.mb * 0.45), self.encode(num_slot, label)))
+                    num_slot.name.encode(), _fmt(size), _fmt(x), _fmt(self.mb * 0.45), numbers[i]))
             content = w.stream(b"".join(ops))
             annots = []
             for x0, y0, x1, y1, href in page.links:
@@ -885,7 +906,7 @@ class Typesetter:
                 if child_refs:
                     d["First"] = child_refs[0]
                     d["Last"] = child_refs[-1]
-                    d["Count"] = -child_count if False else child_count
+                    d["Count"] = child_count
                 w.put(ref, d)
                 total += 1 + child_count
             return refs, total
@@ -934,25 +955,9 @@ class Typesetter:
                           "CIDSystemInfo": {"Registry": "Adobe", "Ordering": "Identity", "Supplement": 0},
                           "FontDescriptor": descriptor, "DW": int(f.advance(0) * scale), "W": widths,
                           "CIDToGIDMap": c2g_ref})
-        to_unicode = w.stream(_to_unicode(slot.used))
+        to_unicode = w.stream(textlayer.to_unicode(slot.used, 2))
         w.put(slot.ref, {"Type": Name("Font"), "Subtype": Name("Type0"), "BaseFont": Name(base_name),
                          "Encoding": Name("Identity-H"), "DescendantFonts": [cid_font], "ToUnicode": to_unicode})
-
-
-def _to_unicode(used: dict[int, str]) -> bytes:
-    lines = [b"/CIDInit /ProcSet findresource begin", b"12 dict begin", b"begincmap",
-             b"/CIDSystemInfo << /Registry (Adobe) /Ordering (UCS) /Supplement 0 >> def",
-             b"/CMapName /Adobe-Identity-UCS def", b"/CMapType 2 def",
-             b"1 begincodespacerange", b"<0000> <FFFF>", b"endcodespacerange"]
-    items = sorted(used.items())
-    for i in range(0, len(items), 100):
-        chunk = items[i:i + 100]
-        lines.append(b"%d beginbfchar" % len(chunk))
-        for gid, text in chunk:
-            lines.append(b"<%04X> <%s>" % (gid, text.encode("utf-16-be").hex().upper().encode()))
-        lines.append(b"endbfchar")
-    lines += [b"endcmap", b"CMapName currentdict /CMap defineresource pop", b"end", b"end"]
-    return b"\n".join(lines)
 
 
 def typeset(book: Book, page_size: str | None = None, text_size: str | None = None) -> bytes:

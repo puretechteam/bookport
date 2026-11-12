@@ -5,14 +5,14 @@ build-backend = "setuptools.build_meta"
 [project]
 name = "bookport"
 dynamic = ["version"]
-description = "Read and write ebooks in every format (EPUB, MOBI, AZW3, PDF, FB2, LIT, LRF, ...) and nine markup languages, and read DjVu, in pure Python. No Calibre, no Pandoc, no dependencies."
+description = "Read and write ebooks in every format (EPUB, MOBI, AZW3, PDF, FB2, LIT, LRF, ...) and nine markup languages, read DjVu, and turn PostScript and EPS into PDF and back, in pure Python. No Calibre, no Pandoc, no Ghostscript, no dependencies."
 readme = "README.md"
 license = "MIT"
 license-files = ["LICENSE"]
 authors = [{ name = "Pure Tech" }]
 requires-python = ">=3.10"
 dependencies = []
-keywords = ["ebook", "epub", "mobi", "azw3", "kindle", "pdf", "fb2", "lit", "lrf", "converter"]
+keywords = ["ebook", "epub", "mobi", "azw3", "kindle", "pdf", "fb2", "lit", "lrf", "postscript", "eps", "converter"]
 classifiers = [
     "Development Status :: 4 - Beta",
     "Intended Audience :: Developers",
@@ -45,7 +45,7 @@ version = { attr = "bookport.__version__" }
 where = ["src"]
 
 [tool.setuptools.package-data]
-bookport = ["fonts/*.ttf.xz", "fonts/*.txt"]
+bookport = ["fonts/*.ttf.xz", "fonts/*.txt", "ps/afm/*.afm", "ps/afm/*.html"]
 
 [tool.pytest.ini_options]
 testpaths = ["tests"]

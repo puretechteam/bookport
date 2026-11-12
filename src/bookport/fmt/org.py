@@ -21,12 +21,23 @@ from ..textwriter import Table, write_text
 from .rst import _BR, _C, _O, MarkupWriter, build_book, el, make_id, node_append, read_include, text_width, unwrap
 
 MAX_MACRO_ROUNDS = 8
-MAX_MACRO_GROWTH = 1_000_000
+MAX_MACRO_GROWTH = 4_000_000  # characters macros may add to one file, all told
 MAX_INLINE_DEPTH = 16
 
-_HEADLINE = re.compile(r"^(\*+) +(.*?)\s*$")
+# (.*\S)? and \s*$ can split the end of a line one way only; "(.*?)\s*$" tried every place in a long
+# run of spaces, and the tags regex did the same from every space (20,000 spaces took seconds)
+_HEADLINE = re.compile(r"^(\*+) +((?:.*\S)?)\s*$")
 _SCRIPT = re.compile(r"\*|[+-]?[\w.,\\]*[^\W_]")
-_TAGS = re.compile(r"\s+(:(?:[\w@#%]+:)+)\s*$")
+_TAGS = re.compile(r":(?:[\w@#%]+:)+")
+
+
+def _split_tags(text: str) -> tuple[str, str]:
+    """A headline's text and its trailing ``:tag1:tag2:`` ("" when it has none)."""
+    t = text.rstrip()
+    parts = t.rsplit(None, 1)
+    if len(parts) == 2 and _TAGS.fullmatch(parts[1]):
+        return t[:len(t) - len(parts[1])].rstrip(), parts[1]
+    return text, ""
 _PRIORITY = re.compile(r"^\[#([A-Za-z0-9])\]\s*")
 _KEYWORD = re.compile(r"^\s*#\+([^\s:]+):(?:\s+(.*)|\s*$)")
 _BEGIN = re.compile(r"^\s*#\+begin_(\S+)(?:\s+(.*?))?\s*$", re.IGNORECASE)
@@ -41,7 +52,7 @@ _PLANNING = re.compile(r"^\s*(?:(?:SCHEDULED|DEADLINE|CLOSED):|CLOCK:)")
 _LATEX_ENV = re.compile(r"^\s*\\begin\{([A-Za-z*]+)\}")
 _CHECKBOX = re.compile(r"^\[([ Xx-])\](?: +|$)")
 _COUNTER = re.compile(r"^\[@(\d+|[A-Za-z])\]\s*")
-_DESC = re.compile(r"^(.*?)\s+::(?:\s+|$)")
+_DESC = re.compile(r"\s::(?:\s+|$)")  # searched: "^(.*?)\s+::" retried the spaces from every place
 _COOKIE = re.compile(r"^<([lcr]?)(\d*)>$")
 _MATH_ENVS = {"equation", "equation*", "align", "align*", "gather", "gather*", "multline", "multline*", "eqnarray",
               "eqnarray*", "displaymath", "math", "flalign", "flalign*", "alignat", "alignat*"}
@@ -114,7 +125,9 @@ class _Org:
         self.toc_spots: list[tuple[ET.Element, int]] = []
         self.bibliography: list[str] = []
         self.macro_n: dict[str, int] = {}
+        self.macro_budget = MAX_MACRO_GROWTH  # characters macros may add to the whole file
         self.seen: list[Path] = []
+        self.include_count: dict[str, int] = {}  # files and bytes included, all told
 
     def drop(self, kind: str, what: str) -> None:
         if kind not in self.lost_kinds:
@@ -153,7 +166,7 @@ class _Org:
             self.lost.append(f"An include nested too deep was left out: {name}")
             return []
         target = name.split("::")[0]
-        text = read_include(base, target, self.top, self.lost, self.seen)
+        text = read_include(base, target, self.top, self.lost, self.seen, count=self.include_count)
         if text is None:
             return []
         lines = _lines(text)
@@ -186,7 +199,7 @@ class _Org:
         if re.match(r"^[a-z]+://", name):
             self.lost.append(f"A setup file on the web wasn't fetched: {name}")
             return
-        text = read_include(base, name, self.top, self.lost, self.seen, "A setup file")
+        text = read_include(base, name, self.top, self.lost, self.seen, "A setup file", count=self.include_count)
         if text is not None and depth < 8:
             self.settings(_lines(text))
 
@@ -300,7 +313,7 @@ class _Org:
         As in Org's exporter, headlines deeper than the ``H`` option (3) become items of a list."""
         i, n = 0, len(lines)
         h_opt = self.opt("H", "3")
-        deepest = int(h_opt) if h_opt.isdigit() else 3
+        deepest = 3 if markup.whole(h_opt) is None else markup.whole(h_opt)
         selected = self._selected(lines)
         skip_level = 0
         skip_own = False
@@ -365,8 +378,7 @@ class _Org:
         for k, line in enumerate(lines):
             m = _HEADLINE.match(line) if line[:1] == "*" else None
             if m:
-                tm = _TAGS.search(m.group(2) or "")
-                heads.append((k, len(m.group(1)), set(tm.group(1).split(":")) - {""} if tm else set()))
+                heads.append((k, len(m.group(1)), set(_split_tags(m.group(2) or "")[1].split(":")) - {""}))
         if not any(tags & self.select for _k, _l, tags in heads):
             return None
         self._first_headline = heads[0][0] if heads else len(lines)
@@ -394,13 +406,16 @@ class _Org:
         while i < n and _PLANNING.match(lines[i]):
             i += 1
         if i < n and re.match(r"^\s*:PROPERTIES:\s*$", lines[i], re.IGNORECASE):
-            i += 1
-            while i < n and not _END_DRAWER.match(lines[i]):
-                pm = re.match(r"^\s*:([^\s:]+):\s*(.*)$", lines[i])
-                if pm:
-                    props[pm.group(1).upper()] = pm.group(2).strip()
-                i += 1
-            i += 1
+            # only a drawer that ends before the next headline: one without :END: swallowed the rest of the file
+            j = i + 1
+            while j < n and not _END_DRAWER.match(lines[j]) and not (lines[j][:1] == "*" and _HEADLINE.match(lines[j])):
+                j += 1
+            if j < n and _END_DRAWER.match(lines[j]):
+                for line in lines[i + 1:j]:
+                    pm = re.match(r"^\s*:([^\s:]+):\s*(.*)$", line)
+                    if pm:
+                        props[pm.group(1).upper()] = pm.group(2).strip()
+                i = j + 1
         words = text.split(None, 1)
         todo = ""
         if words and (words[0] in self.todo or words[0] in self.done):
@@ -410,11 +425,8 @@ class _Org:
         pri = _PRIORITY.match(text)
         if pri:
             text = text[pri.end():]
-        tags: list[str] = []
-        tm = _TAGS.search(text)
-        if tm:
-            tags = [t for t in tm.group(1).split(":") if t]
-            text = text[:tm.start()]
+        text, found = _split_tags(text)
+        tags = [t for t in found.split(":") if t]
         if any(t in self.exclude for t in tags):
             return i, True, None
         if text.strip() == "Footnotes" and not todo:
@@ -425,7 +437,7 @@ class _Org:
             if k >= n or (lines[k][:1] == "*" and _HEADLINE.match(lines[k])):
                 return i, False, None
         h = el(f"h{min(level, 6)}")
-        if self.opt("num", "nil") not in ("nil", "") and (not self.opt("num", "t").isdigit() or level <= int(self.opt("num", "t"))):
+        if self.opt("num", "nil") not in ("nil", "") and (markup.whole(self.opt("num", "t")) is None or level <= markup.whole(self.opt("num", "t"))):
             while len(self.numbers) < level:
                 self.numbers.append(0)
             del self.numbers[level:]
@@ -589,7 +601,7 @@ class _Org:
         elif key == "toc":
             words = value.split()
             if words and words[0].lower() == "headlines":
-                depth = int(words[1]) if len(words) > 1 and words[1].isdigit() else 99
+                depth = markup.whole(words[1]) if len(words) > 1 and markup.whole(words[1]) is not None else 99
                 div = el("div", class_="table-of-contents")
                 self.toc_spots.append((div, depth))
                 parent.append(div)
@@ -725,22 +737,22 @@ class _Org:
             i = j
             if blanks >= 2:
                 break
-        is_desc = not ordered and bool(_DESC.match(_CHECKBOX.sub("", items[0][0])))
+        is_desc = not ordered and bool(_DESC.search(_CHECKBOX.sub("", items[0][0])))
         lst = el("dl" if is_desc else "ol" if ordered else "ul")
         for k, (rest, body, blank_after) in enumerate(items):
             cm = _COUNTER.match(rest)
             if cm:
                 rest = rest[cm.end():]
-                if k == 0 and ordered and cm.group(1).isdigit():
-                    start = int(cm.group(1))
+                if k == 0 and ordered and markup.whole(cm.group(1)) is not None:
+                    start = markup.whole(cm.group(1))
             box = _CHECKBOX.match(rest)
             mark = ""
             if box:
                 rest = rest[box.end():]
                 mark = {" ": "\u2610 ", "-": "\u2610 "}.get(box.group(1), "\u2612 ")
             if is_desc:
-                dm = _DESC.match(rest)
-                term, rest = (dm.group(1), rest[dm.end():]) if dm else ("", rest)
+                dm = _DESC.search(rest)
+                term, rest = (rest[:dm.start()].rstrip(), rest[dm.end():]) if dm else ("", rest)
                 lst.append(el("dt", [mark, *self.inline(term)] if mark else self.inline(term)))
                 item = ET.SubElement(lst, "dd")
                 mark = ""
@@ -816,15 +828,24 @@ class _Org:
     def expand_macros(self, text: str) -> str:
         if "{{{" not in text:
             return text
-        start_len = len(text)
+        def sub(m):
+            # what macros add is counted for each one, against one budget for the file: counted per
+            # round, a single round could already grow a few hundred bytes into gigabytes
+            if self.macro_budget <= 0:
+                return m.group(0)
+            out = self._macro(m)
+            self.macro_budget -= max(0, len(out) - len(m.group(0)))
+            if self.macro_budget < 0:
+                self.drop("macro-growth", "Org macros that grow without end were left unexpanded")
+                return m.group(0)
+            return out
+
         for _ in range(MAX_MACRO_ROUNDS):
-            new = re.sub(r"\{\{\{([\w-]+)(?:\((.{0,4000}?)\))?\}\}\}", self._macro, text, flags=re.DOTALL)
-            if new == text:
+            new = re.sub(r"\{\{\{([\w-]+)(?:\((.{0,4000}?)\))?\}\}\}", sub, text, flags=re.DOTALL)
+            if new == text or self.macro_budget <= 0:
+                text = new
                 break
             text = new
-            if len(text) > start_len + MAX_MACRO_GROWTH:
-                self.drop("macro-growth", "Org macros that grow without end were left unexpanded")
-                break
         return text
 
     def _macro(self, m) -> str:
@@ -1458,10 +1479,11 @@ class OrgWriter(MarkupWriter):
         return "\n".join(head)
 
     def escape(self, s: str) -> str:
-        # a zero-width space after a would-be marker keeps Org from reading text as markup
+        # a zero-width space before a would-be opening marker keeps Org from reading text as markup: a
+        # marker opens only after a space or one of -('"{ (after it, the space was still text to mark up)
         for ch in "*/_=~+":
             if s.count(ch) >= 2:  # only a pair can be markup
-                s = re.sub(rf"(?<![^\s\-('\"{{]){re.escape(ch)}(?=\S)", ch + _ZW, s)  # where Org could open markup
+                s = re.sub(rf"(?<![^\s\-('\"{{]){re.escape(ch)}(?=\S)", _ZW + ch, s)
         s = re.sub(r"(?<=\S)([_^])(?=[^\W_]|\{)", "\\1" + _ZW, s)
         s = s.replace("[[", "[" + _ZW + "[").replace("[fn:", "[" + _ZW + "fn:").replace("{{{", "{" + _ZW + "{{")
         s = s.replace("@@", "@" + _ZW + "@").replace("<<", "<" + _ZW + "<").replace("[cite", "[" + _ZW + "cite")
@@ -1508,6 +1530,13 @@ class OrgWriter(MarkupWriter):
 
     def heading(self, level: int, text: str, anchor: str | None) -> str:
         text = self._markers(text).replace(_BR, " ").replace("\n", " ").strip() or _ZW
+        # words Org reads in a headline: a leading TODO, DONE or COMMENT (which drops the section), a
+        # [#A] priority, trailing :tags:
+        first = text.split(None, 1)[0]
+        if first in ("TODO", "DONE", "COMMENT") or text.startswith("[#"):
+            text = _ZW + text
+        if re.search(r"\s:(?:[\w@#%]+:)+$", text):
+            text = text[:-1] + _ZW + ":"
         out = "*" * level + " " + text
         if anchor:
             out += f"\n:PROPERTIES:\n:CUSTOM_ID: {anchor}\n:END:"

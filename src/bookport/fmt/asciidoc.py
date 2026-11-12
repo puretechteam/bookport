@@ -24,9 +24,46 @@ from .rst import _BR, MarkupWriter, build_book, el, node_append, read_include, u
 MAX_INCLUDE_DEPTH = 8
 MAX_INLINE_DEPTH = 16
 MAX_ATTR_GROWTH = 1_000_000
+MAX_ATTR_VALUE = 65_536  # one attribute's value
+MAX_TABLE_CELLS = 200_000  # grid places one table's spans and repeats may fill
+MAX_TABLE_ROWS = 10_000
+_ESCAPED_BRACE = ""  # \{ while attributes are put in (a private-use character, given back as "{")
 
 _ATTR_ENTRY = re.compile(r"^:(!?)([\w][\w-]*)(!?):(?:[ \t]+(.*)|[ \t]*$)")
-_SECTION = re.compile(r"^(={1,6}|#{1,6})[ \t]+(\S.*?)(?:[ \t]+\1)?[ \t]*$")
+_SECTION_LINE = re.compile(r"^(={1,6}|#{1,6})[ \t]+(\S.*)$")
+
+
+def _literal_code(inner: str) -> str:
+    """Code between backticks: `+text+` (Asciidoctor's literal monospace) and ``pass:[text]`` as their text."""
+    if len(inner) >= 2 and inner[0] == "+" and inner[-1] == "+":
+        return inner[1:-1]
+    if inner.startswith("pass:[") and inner.endswith("]"):
+        return inner[6:-1].replace("\\]", "]")
+    return inner
+
+
+class _Section:
+    """What a section title line matched: group(1) the marks, group(2) the title (closing marks taken off)."""
+
+    __slots__ = ("_groups",)
+
+    def __init__(self, groups: tuple):
+        self._groups = groups
+
+    def group(self, k: int) -> str:
+        return self._groups[k]
+
+
+def _section(line: str) -> _Section | None:
+    # the closing marks are taken off here, not by the regex: "(\S.*?)(?:[ \t]+\1)?[ \t]*$" tried every
+    # place in a long run of spaces (20,000 of them in one title took 20 s)
+    m = _SECTION_LINE.match(line)
+    if m is None:
+        return None
+    marks, title = m.group(1), m.group(2).rstrip()
+    if title.endswith(marks) and title[:-len(marks)].endswith((" ", "\t")):
+        title = title[:-len(marks)].rstrip()
+    return _Section((line, marks, title))
 _DELIM = re.compile(r"^(-{4,}|\.{4,}|={4,}|\*{4,}|_{4,}|\+{4,}|/{4,}|--|`{3}[\w+-]*|[|,:!]={3,})[ \t]*$")
 _BLOCK_ATTR = re.compile(r"^\[(?:[^\[\]]|\[[^\[\]]*\])*\]$")
 _ANCHOR_LINE = re.compile(r"^\[\[([\w:.-][^,\]]*)(?:,\s*([^\]]+))?\]\]$")
@@ -144,6 +181,7 @@ class _Adoc:
         self.note_ids: dict[str, tuple[int, ET.Element]] = {}
         self.counters: dict[str, int] = {}
         self.seen: list[Path] = []
+        self.include_count: dict[str, int] = {}  # files and bytes included, all told
         self.level_shift = 0
 
     def drop(self, kind: str, what: str) -> None:
@@ -208,7 +246,7 @@ class _Adoc:
                     out.append(f":{am.group(1)}{am.group(2)}{am.group(3)}: {value}".rstrip())
                     continue
             if offset and verbatim is None:
-                sm = _SECTION.match(line)
+                sm = _section(line)
                 if sm and sm.group(1)[0] == "=":
                     lv = max(1, min(6, len(sm.group(1)) + offset))
                     line = "=" * lv + line[len(sm.group(1)):]
@@ -220,7 +258,11 @@ class _Adoc:
         if m.group(1) or m.group(3):
             self.attrs.pop(name, None)
         else:
-            self.attrs[name] = self.subst(value) if "{" in value else value
+            value = self.subst(value) if "{" in value else value
+            if len(value) > MAX_ATTR_VALUE:  # values made of values grew tenfold a line: 300 bytes made 10 MB
+                self.drop("attr-size", "Attribute values longer than bookport keeps were cut short")
+                value = value[:MAX_ATTR_VALUE]
+            self.attrs[name] = value
 
     def _condition(self, kind: str, names: str, content: str) -> bool:
         if kind == "ifeval":
@@ -244,7 +286,7 @@ class _Adoc:
         if depth >= MAX_INCLUDE_DEPTH:
             self.lost.append(f"An include nested more than {MAX_INCLUDE_DEPTH} deep was left out: {target}")
             return []
-        text = read_include(base, target, self.top, self.lost, self.seen)
+        text = read_include(base, target, self.top, self.lost, self.seen, count=self.include_count)
         if text is None:
             return []
         lines = _lines(text)
@@ -253,17 +295,19 @@ class _Adoc:
             keep: list[str] = []
             for part in re.split(r"[;,]", named["lines"]):
                 a, sep, b = part.strip().partition("..")
-                if not a.strip().lstrip("-").isdigit():
+                b = b.strip()
+                # "1..x" or "²" made int() fail, and with it the whole book
+                if not re.fullmatch(r"-?\d{1,9}", a.strip(), re.ASCII) or b and not re.fullmatch(r"-?\d{1,9}", b, re.ASCII):
                     continue
                 lo = int(a)
-                hi = (len(lines) if not b.strip() or b.strip() == "-1" else int(b)) if sep else lo
+                hi = (len(lines) if not b or b == "-1" else int(b)) if sep else lo
                 keep += lines[max(lo - 1, 0):hi]
             lines = keep
         tags = named.get("tag") or named.get("tags")
         if tags:
             lines = _tagged(lines, [t for t in re.split(r"[;,]", tags) if t])
-        if named.get("indent", "").isdigit():
-            k = int(named["indent"])
+        if markup.whole(named.get("indent", "")) is not None:
+            k = markup.whole(named["indent"])
             ded = _dedent(lines)
             lines = [" " * k + s if s.strip() else s for s in ded]
         lo = named.get("leveloffset", "")
@@ -284,20 +328,21 @@ class _Adoc:
         start = len(text)
 
         def rep(m):
-            if m.group(1):
-                return "{" + m.group(2) + "}"
+            if m.group(1):  # \{name}: kept, also through the second pass below
+                return _ESCAPED_BRACE + m.group(2) + "}"
             name = m.group(2)
             if ":" in name:
                 kind, _, rest = name.partition(":")
                 if kind in ("counter", "counter2"):
                     cname, _, init = rest.partition(":")
                     cur = self.counters.get(cname)
+                    digits = init.isascii() and init.isdigit() and len(init) < 10
                     if cur is None:
-                        v = int(init) if init.isdigit() else (ord(init) if len(init) == 1 else 1)
+                        v = int(init) if digits else (ord(init) if len(init) == 1 else 1)
                     else:
                         v = cur + 1
                     self.counters[cname] = v
-                    shown = chr(v) if init and not init.isdigit() else str(v)
+                    shown = chr(min(v, 0x10FFFF)) if init and not digits else str(v)
                     self.attrs[cname] = shown
                     return shown if kind == "counter" else ""
                 if kind == "set":
@@ -313,12 +358,12 @@ class _Adoc:
         out = _ATTR_REF.sub(rep, text)
         if out != text and "{" in out and len(out) < start + MAX_ATTR_GROWTH:
             out = _ATTR_REF.sub(rep, out)  # an attribute's value can name another
-        return out
+        return out.replace(_ESCAPED_BRACE, "{")
 
     # --- blocks ------------------------------------------------------------------------------------
     def document(self, lines: list[str], body: ET.Element) -> None:
         i = self.header(lines)
-        levels = [len(m.group(1)) for s in lines[i:] if s[:1] in "=#" and (m := _SECTION.match(s))]
+        levels = [len(m.group(1)) for s in lines[i:] if s[:1] in "=#" and (m := _section(s))]
         self.level_shift = 1 if 1 in levels else 0  # book parts ("= Part") in the body: they are the h1s
         self.blocks(lines[i:], body, 0, top=True)
 
@@ -333,7 +378,7 @@ class _Adoc:
         k = i
         while k < n and (_ANCHOR_LINE.match(lines[k]) or _BLOCK_ATTR.match(lines[k])):
             k += 1
-        m = _SECTION.match(lines[k]) if k < n else None
+        m = _section(lines[k]) if k < n else None
         if not m or len(m.group(1)) != 1:
             return i
         title = m.group(2)
@@ -410,7 +455,7 @@ class _Adoc:
                 i += 1
                 continue
             if c in "=#":
-                sm = _SECTION.match(line)
+                sm = _section(line)
                 if sm and not (c == "=" and _DELIM.match(line)):
                     self.section(sm, meta, parent)
                     meta = {}
@@ -490,6 +535,8 @@ class _Adoc:
         style = meta.get("style", "")
         h = el(f"h{max(1, min(level, 6))}")
         nodes = self.inline(title)
+        # the id comes from these nodes: reading the title a second time ran {counter:...} and footnotes twice
+        title_text = "".join(x if isinstance(x, str) else "".join(x.itertext()) + (x.tail or "") for x in nodes)
         if style == "appendix":
             self.counters["appendix"] = self.counters.get("appendix", 0) + 1
             nodes = [f"{self.attrs.get('appendix-caption', 'Appendix')} {chr(64 + min(self.counters['appendix'], 26))}: ",
@@ -500,7 +547,7 @@ class _Adoc:
         if not hid:
             prefix = self.attrs.get("idprefix", "_")
             sep = self.attrs.get("idseparator", "_")
-            base = re.sub(r"[^\w\s.-]+", "", " ".join(markup.text_of(el("x", self.inline(title))).split()).lower())
+            base = re.sub(r"[^\w\s.-]+", "", " ".join(title_text.split()).lower())
             base = re.sub(r"[\s.-]+", sep or "_", base).strip(sep or "_")
             hid = prefix + base if base else prefix + "section"
             k, cand = 2, hid
@@ -851,6 +898,10 @@ class _Adoc:
         r = c = 0
         current: list[dict] = []
         for cell in cells:
+            # repeats of tall cells fill rows of their own: "100*.500+|x" made 49,501 rows from 22 bytes
+            if len(taken) > MAX_TABLE_CELLS or len(rows) > MAX_TABLE_ROWS:
+                self.drop("table-size", "A table larger than bookport reads was cut short")
+                break
             sm = re.match(r"^(?:(\d+)\*)?(?:(\d*)(?:\.(\d+))?\+)?([<^>])?(?:\.[<^>])?([adehlmsv])?$", cell["spec"])
             dup = int(sm.group(1)) if sm and sm.group(1) else 1
             cs = int(sm.group(2)) if sm and sm.group(2) else 1
@@ -858,6 +909,8 @@ class _Adoc:
             style = sm.group(5) if sm and sm.group(5) else ""
             align = {"<": "left", "^": "center", ">": "right"}.get(sm.group(4) if sm else "", "")
             for _ in range(min(dup, 1000)):
+                if len(taken) > MAX_TABLE_CELLS or len(rows) > MAX_TABLE_ROWS:
+                    break
                 while (r, c) in taken:
                     c += 1
                     if c >= width:
@@ -1123,7 +1176,7 @@ class _Adoc:
                 inner = text[e:k]
                 flush()
                 ch = tok[0]
-                out.append(el(_MARK_TAG[ch], sub(inner) if ch != "`" else [inner]))
+                out.append(el(_MARK_TAG[ch], sub(inner) if ch != "`" else [_literal_code(inner)]))
                 pos = k + 2
                 continue
             if kind == "mark1":
@@ -1135,7 +1188,7 @@ class _Adoc:
                         inner = text[e:k]
                         if inner and not inner[-1].isspace():
                             flush()
-                            out.append(el(_MARK_TAG[ch], sub(inner) if ch != "`" else [inner]))
+                            out.append(el(_MARK_TAG[ch], sub(inner) if ch != "`" else [_literal_code(inner)]))
                             pos = k + 1
                             continue
                 buf.append(tok)
@@ -1348,8 +1401,8 @@ def _psv_cells(content: list[str], sep: str) -> tuple[list[dict], int, bool]:
 def _col_specs(cols: str) -> list[dict]:
     if not cols.strip():
         return []
-    if cols.strip().isdigit():
-        return [{"style": "", "align": ""} for _ in range(min(int(cols), 1000))]
+    if markup.whole(cols.strip()) is not None:
+        return [{"style": "", "align": ""} for _ in range(min(markup.whole(cols.strip()), 1000))]
     out = []
     for part in re.split(r"[,;]", cols):
         part = part.strip()
@@ -1659,9 +1712,11 @@ class AsciiDocWriter(MarkupWriter):
         s = " ".join(s.split("\n"))
         if not s.strip():
             return s
-        if re.search(r"[*_`#^~{}+\[\]\\<>|]|--|\(C\)|\(R\)|\(TM\)", s):
+        # the reader takes the text between `` and `` as it stands (pass:[...] in there stayed "pass:[...]"):
+        # only attribute references, which are put in before, need their \
+        if "``" in s or s.startswith("`") or s.endswith("`"):
             return "``pass:[" + s.replace("]", "\\]") + "]``"
-        return f"``{s}``"
+        return "``" + re.sub(r"\{(?=[\w][\w-]*(?::[^}]*)?\})", r"\\{", s) + "``"
 
     def raw_inline(self, text: str, fmt: str) -> str:
         return f"+++{text}+++" if fmt == "html" else self.code(text)

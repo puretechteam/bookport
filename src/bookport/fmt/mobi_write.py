@@ -10,6 +10,7 @@ filepos links and an NCX index. Text is PalmDOC compressed in 4096-byte records.
 
 from __future__ import annotations
 
+import bisect
 import random
 import re
 import struct
@@ -302,7 +303,7 @@ class KF8Builder:
             return b32(aid_counter[0], 1)
 
         for fnum, (href, _res) in enumerate(book.documents()):
-            root = self.prepare(href, book.tree(href).__copy__() if False else _deep_copy(book.tree(href)))
+            root = self.prepare(href, _deep_copy(book.tree(href)))
             body = root.find("body")
             container = body
             while True:
@@ -389,7 +390,7 @@ def _deep_copy(el):
     return copy.deepcopy(el)
 
 
-def _ncx_entries(book: Book, pos_of, with_fid: bool):
+def _ncx_entries(book: Book, pos_of):
     """NCX entries ordered by depth (all top-level first), with parent/child links."""
     flat = []  # (depth, title, position, fid tuple, parent index in flat)
 
@@ -428,8 +429,8 @@ def _ncx_index(entries, text_len: int, kf8: bool) -> list[bytes]:
     out = []
     for i, e in enumerate(entries):
         start = e["pos"][2] if kf8 else e["pos"]
-        later = [p for p in positions if p > start]
-        length = (later[0] if later else text_len) - start
+        k = bisect.bisect_right(positions, start)  # the next entry's start (a scan of them all was quadratic)
+        length = (positions[k] if k < len(positions) else text_len) - start
         tags = {1: [start], 2: [max(0, length)], 3: [cncx.add(e["title"])], 4: [e["depth"]]}
         if e["parent"] >= 0:
             tags[21] = [e["parent"]]
@@ -460,7 +461,7 @@ def build_kf8(book: Book, res: Resources):
     def pos_of(doc, frag):
         return positions.get((doc, frag))
 
-    ncx_entries = _ncx_entries(book, pos_of, with_fid=True)
+    ncx_entries = _ncx_entries(book, pos_of)
     ncx = _ncx_index(ncx_entries, len(kb.flows[0]), kf8=True) if ncx_entries else []
     frag_tagx = [(2, 1, 1, 0), (3, 1, 2, 0), (4, 1, 4, 0), (6, 2, 8, 0), (0, 0, 0, 1)]
     skel_tagx = [(1, 1, 3, 0), (6, 2, 12, 0), (0, 0, 0, 1)]
@@ -612,7 +613,7 @@ def build_mobi6(book: Book, res: Resources):
         key = f"{doc}#{frag}" if frag else doc
         return anchors.get(key)
 
-    entries = _ncx_entries(book, pos_of, with_fid=False)
+    entries = _ncx_entries(book, pos_of)
     ncx = _ncx_index(entries, len(text), kf8=False) if entries else []
     start = None
     body = next((lm for lm in book.landmarks if lm.type == "bodymatter"), None)
@@ -692,7 +693,6 @@ def write(book: Book, path, fmt: str = "mobi", compress: bool = True, fonts: boo
     uid = random.Random(b.metadata.uid()).getrandbits(32)
     kf8_text, frag_recs, skel_recs, guide_recs, ncx8, fdst, nflows, start8 = build_kf8(b, res)
     kf8_texts = text_records(kf8_text, compress)
-    kf8_flow0 = len(b"")  # noqa: F841 - layout notes
     records: list[bytes] = []
     if fmt == "azw3":
         # KF8 only: r0, text, padding, indexes, resources, FDST, FLIS, FCIS, EOF

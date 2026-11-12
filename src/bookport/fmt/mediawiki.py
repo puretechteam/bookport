@@ -107,15 +107,13 @@ def local_picture(base_dir: Path | None, name: str, lost: list[str]) -> str | No
 # --- reading -----------------------------------------------------------------------------------
 
 _MARK = re.compile("\x00(\\d+)\x00")
-_SPLIT_MARK = re.compile("\x00(\\d+)\x00")
+_SPLIT_MARK = _MARK
 # tags whose content isn't wikitext (or is parsed on its own), and HTML blocks that nest
 _EXT = ("nowiki|pre|math|chem|ce|syntaxhighlight|source|ref|references|gallery|poem|blockquote|table|ul|ol|dl|"
         "score|timeline|graph|mapframe|maplink|templatedata|imagemap|hiero|inputbox|categorytree|templatestyles|"
         "section|indicator|includeonly|charinsert|langconvert|phonos|ipa")
 _OPEN = re.compile(rf"<!--|<({_EXT})(?=[\s/>])([^>]*?)(/?)>", re.IGNORECASE)
 _NESTING = {"blockquote", "table", "ul", "ol", "dl"}
-_UNKNOWN_EXT = {"score", "timeline", "graph", "mapframe", "maplink", "imagemap", "hiero", "inputbox",
-                "categorytree", "langconvert", "phonos"}
 _SILENT = {"templatestyles", "section", "indicator", "includeonly", "templatedata"}
 _BLOCK_KINDS = {"pre", "source", "gallery", "poem", "bq", "html", "raw", "fig", "mathb"}
 _ATTR = re.compile(r"""([\w:-]+)\s*=\s*(?:"([^"]*)"|'([^']*)'|([^\s"'>/]+))""")
@@ -124,20 +122,23 @@ _MAGIC = re.compile(r"__(?:NOTOC|FORCETOC|TOC|NOEDITSECTION|NEWSECTIONLINK|NONEW
                     r"EXPECTUNUSEDCATEGORY|EXPECTUNUSEDTEMPLATE|NOGLOBAL|ARCHIVEDTALK|NOTALK|NOEXTERNALLANGLINKS)__")
 _BRACES = re.compile(r"\{{2,}|\}{2,}")
 _ILINK = re.compile(r"\[\[([^\[\]\n]*)\]\]([a-z]+)?")
+# one space, then the label (stripped where it is used): "[ \t]+" before a label that may also start
+# with spaces split a long run of them every possible way; the label is bounded so that each "[" looks
+# at most that far for its "]"
 _ELINK = re.compile(r"\[((?:https?:|ftp:|ftps:|mailto:|news:|irc:|ircs:|gopher:|sftp:|ssh:|telnet:|git:|svn:|//)"
-                    r"[^\s\[\]<>\"\x00]+)(?:[ \t]+([^\]\n]*))?\]", re.IGNORECASE)
+                    r"[^\s\[\]<>\"\x00]+)(?:[ \t]([^\]\n]{0,2000}))?\]", re.IGNORECASE)
 _BARE = re.compile(r"\b(?:https?|ftp)://[^\s<>\[\]{}\"|\x00-\x08]+")
 _TAG = re.compile(r"<(/?)([A-Za-z][A-Za-z0-9]*)((?:[\s/][^<>]*)?)>")
 _BLOCKISH = re.compile(r"(?:</?(?:div|center|p)\b[^<>]*>|<hr\b[^<>]*>)[ \t]*", re.IGNORECASE)
 _INLINE_TAGS = {"b", "i", "u", "s", "strike", "del", "ins", "sup", "sub", "small", "big", "span", "code", "tt", "kbd",
                 "var", "samp", "abbr", "cite", "q", "em", "strong", "font", "mark", "dfn", "bdi", "bdo", "ruby", "rt",
                 "rp", "rb", "time", "data", "wbr", "br"}
-_KEEP_ATTRS = {"title", "lang", "dir", "class", "style"}
+_KEEP_ATTRS = {"title", "lang", "dir", "class", "style", "id"}  # id: the writer's link targets are <span id>s
 _FILE_NS = {"file", "image", "media", "archivo", "datei", "fichier", "bild", "imagen", "immagine", "ficheiro",
             "plik", "bestand", "arquivo", "fil", "файл", "ファイル", "文件", "画像"}
 _IMG_OPTS = re.compile(r"^(?:thumb|thumbnail|frame|framed|frameless|border|left|right|center|centre|none|upright"
-                       r"|baseline|middle|sub|super|text-top|text-bottom|top|bottom|loop|muted|\d*x?\d+\s*px"
-                       r"|(?:upright|link|alt|page|class|lang|start|end|thumbtime|alt)\s*=.*)$", re.IGNORECASE)
+                       r"|baseline|middle|sub|super|text-top|text-bottom|top|bottom|loop|muted|\d*x\d+\s*px|\d+\s*px"
+                       r"|(?:upright|link|alt|page|class|lang|start|end|thumbtime)\s*=.*)$", re.IGNORECASE)
 _STRUCT = re.compile(r"<(/?)(table|thead|tbody|tfoot|tr|td|th|caption|ul|ol|li|dl|dt|dd)\b([^<>]*)>", re.IGNORECASE)
 _CELLISH = {"td", "th", "li", "dt", "dd", "caption"}
 
@@ -150,12 +151,18 @@ def _attrs(s: str) -> dict[str, str]:
     return out
 
 
+def _start_number(s: str) -> int:
+    """A list's start="-3" or "7" (the caller has checked it is a whole number after any minus sign)."""
+    s = s.strip()
+    return -markup.whole(s.lstrip("-")) if s.startswith("-") else markup.whole(s)
+
+
 def _cell_attrs(a: dict[str, str]) -> str:
     out = []
     for k in ("colspan", "rowspan"):
         v = a.get(k, "").strip()
-        if v.isdigit() and int(v) > 1:
-            out.append(f' {k}="{min(int(v), 500)}"')
+        if (markup.whole(v) or 0) > 1:
+            out.append(f' {k}="{min(markup.whole(v), 500)}"')
     align = a.get("align", "").strip().lower()
     m = re.search(r"text-align\s*:\s*(left|right|center|justify)", a.get("style", ""), re.IGNORECASE)
     align = align or (m.group(1).lower() if m else "")
@@ -178,6 +185,7 @@ class _Wiki:
         self.ext_count = 0
         self.in_note = 0
         self.ids: set[str] = set()
+        self.id_next: dict[str, int] = {}
 
     def keep(self, *slot) -> str:
         self.slots.append(slot)
@@ -442,10 +450,12 @@ class _Wiki:
         inner = self.inline(text, depth)
         plain = html.unescape(re.sub(r"<[^>]*>", "", inner)).strip()
         hid = re.sub(r"\s+", "_", plain) or "section"
-        base, k = hid, 2
-        while hid in self.ids:
+        if hid in self.ids:
+            base, k = hid, self.id_next.get(hid, 2)  # on from the last one given, not from 2 each time
+            while f"{base}_{k}" in self.ids:
+                k += 1
             hid = f"{base}_{k}"
-            k += 1
+            self.id_next[base] = k + 1
         self.ids.add(hid)
         return f'<h{level} id="{attr(hid)}">{inner}</h{level}>'
 
@@ -797,8 +807,8 @@ class _Wiki:
     def html_block(self, tag: str, a: dict[str, str], content: str, depth: int) -> str:
         """An HTML table or list written in the page: its tags kept, the text between them read as wikitext."""
         start = ""
-        if tag == "ol" and a.get("start", "").strip().lstrip("-").isdigit():
-            start = f' start="{int(a["start"].strip())}"'
+        if tag == "ol" and markup.whole(a.get("start", "").strip().lstrip("-")) is not None:
+            start = f' start="{_start_number(a["start"])}"'
         out = [f"<{tag}{start}>"]
         text = self.prepare(content)
         pos = 0
@@ -822,7 +832,7 @@ class _Wiki:
             extra = _cell_attrs(_attrs(m.group(3))) if name in ("td", "th") else ""
             if name == "ol":
                 s = _attrs(m.group(3)).get("start", "").strip()
-                extra = f' start="{int(s)}"' if s.lstrip("-").isdigit() else ""
+                extra = f' start="{_start_number(s)}"' if markup.whole(s.lstrip("-")) is not None else ""
             out.append(f"<{name}{extra}>")
             inside.append(name)
         self._html_text(text[pos:], inside, out, depth)

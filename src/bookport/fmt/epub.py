@@ -12,7 +12,6 @@ from __future__ import annotations
 
 import datetime as _dt
 import hashlib
-import io
 import posixpath
 import re
 import xml.etree.ElementTree as ET
@@ -94,7 +93,6 @@ def read_zip(z: zipfile.ZipFile) -> Book:
     base = posixpath.dirname(opf_path)
     book = Book()
     book.source_format = "epub"
-    version = opf.get("version", "2.0")
     meta_el = _find(opf, "metadata")
     manifest_el = _find(opf, "manifest")
     spine_el = _find(opf, "spine")
@@ -149,7 +147,7 @@ def read_zip(z: zipfile.ZipFile) -> Book:
         toc_id = spine_el.get("toc")
         if toc_id in items:
             ncx_href = items[toc_id][0]
-    book.metadata = _read_metadata(meta_el, version)
+    book.metadata = _read_metadata(meta_el)
     book.fixed_layout = any(_local(m.tag) == "meta" and m.get("property") == "rendition:layout"
                             and (m.text or "").strip() == "pre-paginated" for m in meta_el.iter()) if meta_el is not None else False
     if not book.fixed_layout and "com.apple.ibooks.display-options.xml" in "".join(lower):
@@ -173,7 +171,7 @@ def read_zip(z: zipfile.ZipFile) -> Book:
                 if target in book.resources:
                     book.landmarks.append(Landmark(_guide_type(ref.get("type", "")), ref.get("title", ""),
                                                    target + (f"#{frag}" if frag else "")))
-    book.cover = _find_cover(book, meta_el, items, guide, base, to_href)
+    book.cover = _find_cover(book, meta_el, items)
     # the nav document is regenerated on write; keep it only if it's part of the reading order
     if nav_href and nav_href not in book.spine:
         book.remove(nav_href)
@@ -277,7 +275,7 @@ def _guide_type(t: str) -> str:
             "foreword": "foreword", "preface": "preface", "notes": "endnotes", "loi": "loi", "lot": "lot"}.get(t, t or "bodymatter")
 
 
-def _read_metadata(meta_el, version) -> Metadata:
+def _read_metadata(meta_el) -> Metadata:
     md = Metadata()
     if meta_el is None:
         return md
@@ -299,7 +297,8 @@ def _read_metadata(meta_el, version) -> Metadata:
         rid = e.get("id", "")
         ref = refines.get(rid, {})
         if name == "title" and text:
-            titles.append((ref.get("title-type", "main"), int(ref.get("display-seq", "0") or 0), text))
+            seq = re.match(r"\s*\d+", ref.get("display-seq", ""))  # "1.0" and the like are seen too
+            titles.append((ref.get("title-type", "main"), int(seq[0]) if seq else 0, text))
             if ref.get("file-as"):
                 md.title_sort = ref["file-as"]
             if e.get("file-as") or e.get("opf:file-as"):
@@ -329,6 +328,9 @@ def _read_metadata(meta_el, version) -> Metadata:
                 scheme, value = "doi", text.split(":", 2)[-1]
             elif low.startswith(("http://", "https://")) and not scheme:
                 scheme = "url"
+            elif (not scheme and (named := re.fullmatch(r"([a-z][a-z0-9-]{1,30}):(?!//)(.+)", text, re.IGNORECASE))
+                    and named[1].lower() not in ("urn", "http", "https")):
+                scheme, value = named[1].lower(), named[2]  # "asin:B00X": how EPUB 3 output keeps the scheme
             elif not scheme:
                 scheme = "uuid" if re.fullmatch(r"[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}", low) else (
                     "isbn" if re.fullmatch(r"(97[89])?\d{9}[\dx]", low.replace("-", "")) else "id")
@@ -444,7 +446,7 @@ def _read_ncx(book: Book, ncx_href: str) -> None:
                                        _abs(ncx_href, content.get("src"))))
 
 
-def _find_cover(book, meta_el, items, guide, base, to_href):
+def _find_cover(book, meta_el, items):
     for iid, (href, props) in items.items():
         if "cover-image" in props.split() and book.resources[href].is_image:
             return href
@@ -489,6 +491,9 @@ def _only_image(book, doc):
 
 def write(book: Book, path_or_file, version: int = 3, cover_page: bool = True, **_opts) -> None:
     """Write ``book`` as an EPUB. ``version`` is 3 (default, with an NCX too) or 2."""
+    if str(version).strip() not in ("2", "3"):
+        raise BookportError(f"EPUB version {version!r}: use 2 or 3")
+    version = int(str(version).strip())
     from .. import clean, links
     book = prepare(book, cover_page=cover_page)
     clean.clean_book(book)
@@ -504,9 +509,8 @@ def write(book: Book, path_or_file, version: int = 3, cover_page: bool = True, *
     ids = _manifest_ids(book)
     nav_href = "nav.xhtml" if "nav.xhtml" not in book.resources else book.unique_href("nav.xhtml")
     ncx_href = "toc.ncx" if "toc.ncx" not in book.resources else book.unique_href("toc.ncx")
-    out = io.BytesIO() if not hasattr(path_or_file, "write") else None
-    target = out if out is not None else path_or_file
-    with zipfile.ZipFile(target, "w", zipfile.ZIP_DEFLATED, compresslevel=6) as z:
+    # straight to the file: building it in memory first held the whole book twice
+    with zipfile.ZipFile(path_or_file, "w", zipfile.ZIP_DEFLATED, compresslevel=6) as z:
         z.writestr(zipfile.ZipInfo("mimetype", date_time=(2020, 1, 1, 0, 0, 0)), "application/epub+zip",
                    compress_type=zipfile.ZIP_STORED)
         z.writestr("META-INF/container.xml", CONTAINER)
@@ -521,9 +525,6 @@ def write(book: Book, path_or_file, version: int = 3, cover_page: bool = True, *
         for href, res in book.resources.items():
             compress = zipfile.ZIP_STORED if res.media_type in ("image/jpeg", "image/png", "image/gif") else zipfile.ZIP_DEFLATED
             z.writestr(zipfile.ZipInfo(f"OEBPS/{href}", date_time=(2020, 1, 1, 0, 0, 0)), res.data, compress_type=compress)
-    if out is not None:
-        with open(path_or_file, "wb") as f:
-            f.write(out.getvalue())
 
 
 CONTAINER = """<?xml version="1.0" encoding="UTF-8"?>
@@ -694,7 +695,8 @@ def opf_document(book: Book, version, uid, modified, ids, props, nav_href, ncx_h
         if value == uid:
             continue
         if v3:
-            text = f"urn:isbn:{value}" if scheme == "isbn" else (f"urn:uuid:{value}" if scheme == "uuid" else value)
+            text = f"urn:isbn:{value}" if scheme == "isbn" else (f"urn:uuid:{value}" if scheme == "uuid" else (
+                value if scheme in ("url", "id") or value.lower().startswith(("urn:", "doi:")) else f"{scheme}:{value}"))
             out.append(f"    <dc:identifier>{_esc(text)}</dc:identifier>\n")
         else:
             out.append(f'    <dc:identifier opf:scheme="{_esc(scheme)}">{_esc(value)}</dc:identifier>\n')

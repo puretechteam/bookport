@@ -11,130 +11,20 @@ from __future__ import annotations
 import datetime
 import hashlib
 import os
+import struct
 import zlib
 
 from .. import limits
 from ..errors import BookportError
 from ..pdf.objects import Name, Ref, Writer
+from ..pdf.textlayer import Fonts as _Fonts
+from ..pdf.textlayer import _num
+from ..pdf.textlayer import text_ops as _text_ops
 from . import anno, composite, jpeg, mmr, text
 from .doc import Document, Page
 
 QUALITY = 75  # JPEG quality of reduced backgrounds (smoothed further by the viewer's scaling)
 PHOTO_QUALITY = 85  # and of full-resolution pictures
-
-
-def _num(v: float) -> bytes:
-    s = f"{v:.3f}".rstrip("0").rstrip(".")
-    return (s if s not in ("-0", "") else "0").encode()
-
-
-class _Fonts:
-    """Invisible-text fonts: Helvetica (a standard font, not embedded) with 1-byte codes given to
-    characters as they come, and a ToUnicode map so the text can be found and copied."""
-
-    PER_FONT = 224
-
-    def __init__(self, w: Writer):
-        self.w = w
-        self.refs: list[Ref] = []
-        self.chars: list[dict[str, int]] = []
-        self.where: dict[str, tuple[int, int]] = {}
-
-    def code(self, ch: str) -> tuple[int, int]:
-        got = self.where.get(ch)
-        if got is None:
-            if 32 <= ord(ch) < 127 and (not self.chars or ch not in self.chars[0]) and self._free(0, ord(ch)):
-                got = (0, ord(ch))  # plain ASCII keeps its own code in the first font
-            else:
-                got = self._next()
-            self.where[ch] = got
-            self.chars[got[0]][ch] = got[1]
-        return got
-
-    def _free(self, font: int, code: int) -> bool:
-        if not self.chars:
-            self._new()
-        return code not in self.chars[font].values()
-
-    def _next(self) -> tuple[int, int]:
-        if not self.chars:
-            self._new()
-        for f in range(len(self.chars)):
-            used = set(self.chars[f].values())
-            if len(used) >= self.PER_FONT + (95 if f == 0 else 0):
-                continue
-            for c in list(range(161, 256)) + list(range(1, 32)) + list(range(127, 161)) + list(range(32, 127)):
-                if c not in used and (f > 0 or not 32 <= c < 127):
-                    return f, c
-        self._new()
-        return len(self.chars) - 1, 161
-
-    def _new(self) -> None:
-        self.chars.append({})
-        self.refs.append(self.w.reserve())
-
-    def finish(self) -> None:
-        for ref, chars in zip(self.refs, self.chars):
-            if not chars:
-                self.w.put(ref, {"Type": Name("Font"), "Subtype": Name("Type1"), "BaseFont": Name("Helvetica")})
-                continue
-            codes = sorted(chars.values())
-            first, last = codes[0], codes[-1]
-            diffs: list = []
-            by_code = {c: ch for ch, c in chars.items()}
-            prev = None
-            for c in codes:
-                if prev is None or c != prev + 1:
-                    diffs.append(c)
-                diffs.append(Name(f"g{c}"))
-                prev = c
-            lines = [b"/CIDInit /ProcSet findresource begin", b"12 dict begin", b"begincmap",
-                     b"/CIDSystemInfo << /Registry (Adobe) /Ordering (UCS) /Supplement 0 >> def",
-                     b"/CMapName /Adobe-Identity-UCS def", b"/CMapType 2 def", b"1 begincodespacerange", b"<00> <FF>",
-                     b"endcodespacerange"]
-            items = sorted(by_code.items())
-            for i in range(0, len(items), 100):
-                chunk = items[i:i + 100]
-                lines.append(b"%d beginbfchar" % len(chunk))
-                for c, ch in chunk:
-                    lines.append(b"<%02X> <%s>" % (c, ch.encode("utf-16-be").hex().upper().encode()))
-                lines.append(b"endbfchar")
-            lines += [b"endcmap", b"CMapName currentdict /CMap defineresource pop", b"end", b"end"]
-            tu = self.w.stream(b"\n".join(lines))
-            self.w.put(ref, {"Type": Name("Font"), "Subtype": Name("Type1"), "BaseFont": Name("Helvetica"),
-                             "FirstChar": first, "LastChar": last, "Widths": [500] * (last - first + 1),
-                             "Encoding": {"Type": Name("Encoding"), "Differences": diffs}, "ToUnicode": tu})
-
-
-def _text_ops(lines, fonts: _Fonts, used: set[int]) -> bytes:
-    """Invisible words (render mode 3), each stretched over its box."""
-    if not lines:
-        return b""
-    out = [b"BT 3 Tr\n"]
-    cur_font = None
-    cur_size = None
-    for line in lines:
-        for k, (word, x0, y0, x1, y1) in enumerate(line):
-            h = max(1.0, y1 - y0)
-            word_chars = word + (" " if k + 1 < len(line) else "")
-            codes = [fonts.code(ch) for ch in word_chars]
-            n = len(word)
-            sx = max(0.01, (x1 - x0) / (n * 0.5 * h)) if n else 1.0
-            # split the word where its characters fall in different fonts
-            parts: list[tuple[int, bytearray]] = []
-            for f, c in codes:
-                if not parts or parts[-1][0] != f:
-                    parts.append((f, bytearray()))
-                parts[-1][1].append(c)
-            out.append(b"%s 0 0 1 %s %s Tm\n" % (_num(sx), _num(x0), _num(y0 + 0.21 * h)))
-            for f, data in parts:
-                used.add(f)
-                if (f, h) != (cur_font, cur_size):
-                    out.append(b"/T%d %s Tf\n" % (f, _num(h)))
-                    cur_font, cur_size = f, h
-                out.append(b"<" + data.hex().encode() + b"> Tj\n")
-    out.append(b"ET\n")
-    return b"".join(out)
 
 
 def _mask_image(packed: bytes, width: int, height: int) -> tuple[bytes, dict]:
@@ -218,9 +108,12 @@ def _prepare(page: Page) -> _Prepared:
                     _num(r / 255), _num(g / 255), _num(b / 255), W, H, name.encode()))
     except BookportError as e:
         out.lost = f"Page {page.index + 1} couldn't be drawn and was left blank: {e}"
+    except (struct.error, IndexError, ValueError, OverflowError, MemoryError, RecursionError) as e:
+        out.lost = f"Page {page.index + 1} couldn't be drawn and was left blank: it's damaged ({type(e).__name__})"
+        out.images, out.ops = [], []
     try:
         out.lines = text.lines(page)
-    except BookportError:
+    except (BookportError, struct.error, IndexError, ValueError, OverflowError, RecursionError):
         out.lines = []
     page.doc.cache.pop(("text", page.index), None)
     return out

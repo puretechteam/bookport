@@ -156,6 +156,7 @@ class Document:
         self.bundled = True
         self.lost: list[str] = []
         self._loaded: dict[str, tuple[bytes, list] | None] = {}
+        self._by_id: tuple | None = None  # (how many components, by ID, by name or title), made on the first look-up
         self.cache: dict = {}
         self._read()
 
@@ -225,9 +226,15 @@ class Document:
         """(data, chunks, form type) of a component by ID, or None when it can't be had."""
         if cid in self._loaded:
             return self._loaded[cid]
-        comp = next((c for c in self.components if c.id == cid), None)
-        if comp is None:
-            comp = next((c for c in self.components if c.name == cid or c.title == cid), None)
+        if self._by_id is None or self._by_id[0] != len(self.components):  # each search was through every one
+            by_id: dict[str, Component] = {}
+            by_name: dict[str, Component] = {}
+            for c in self.components:
+                by_id.setdefault(c.id, c)
+                by_name.setdefault(c.name, c)
+                by_name.setdefault(c.title, c)
+            self._by_id = (len(self.components), by_id, by_name)
+        comp = self._by_id[1].get(cid) or self._by_id[2].get(cid)
         got = None
         if comp is not None:
             try:

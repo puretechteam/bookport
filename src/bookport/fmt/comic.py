@@ -131,16 +131,18 @@ def _comic_info(book: Book, data: bytes) -> list[tuple[int, str]]:
     md.language = t("LanguageISO")
     md.subjects = [g.strip() for g in re.split(r"[,;]", t("Genre")) if g.strip()]
     if t("Year"):
-        md.date = t("Year") + (f"-{int(t('Month')):02d}" if t("Month").isdigit() else "") + (
-            f"-{int(t('Day')):02d}" if t("Day").isdigit() and t("Month").isdigit() else "")
+        month, day = markup.whole(t("Month")), markup.whole(t("Day"))
+        md.date = t("Year") + (f"-{month:02d}" if month is not None else "") + (
+            f"-{day:02d}" if day is not None and month is not None else "")
     if t("Manga").lower() == "yesandrighttoleft":
         book.direction = "rtl"
     # ComicRack's page bookmarks: (page index, chapter title)
     marks = []
     for page in root.iterfind("Pages/Page"):
         title = " ".join(page.get("Bookmark", "").split())
-        if title and page.get("Image", "").isdigit():
-            marks.append((int(page.get("Image")), title))
+        index = markup.whole(page.get("Image", ""))
+        if title and index is not None:
+            marks.append((index, title))
     return marks
 
 
@@ -314,6 +316,20 @@ def _vint(data, pos):
     return value, pos
 
 
+def _rar5_encrypted(data: bytes, pos: int, end: int) -> bool:
+    """Whether a RAR 5 file header's extra area (``pos`` to ``end``) has a file encryption record (type 1):
+    a password on the files only, which leaves the archive's headers readable."""
+    while 0 <= pos < end:
+        size, q = _vint(data, pos)  # the size counts from the record's type on
+        kind, _ = _vint(data, q)
+        if kind == 1:
+            return True
+        if size == 0:
+            break
+        pos = q + size
+    return False
+
+
 def _rar5(data: bytes):
     pos = 8
     n = len(data)
@@ -323,13 +339,15 @@ def _rar5(data: bytes):
         hstart = p
         htype, p = _vint(data, p)
         hflags, p = _vint(data, p)
-        dsize = 0
+        dsize = extra = 0
         if hflags & 1:
-            _extra, p = _vint(data, p)
+            extra, p = _vint(data, p)
         if hflags & 2:
             dsize, p = _vint(data, p)
         if htype == 4:
             raise DRMError("comic", "the archive is encrypted (password protected)")
+        if htype == 2 and extra and _rar5_encrypted(data, hstart + hsize - extra, hstart + hsize):
+            raise DRMError("comic", "its pages are encrypted (password protected)")
         if htype == 2:
             fflags, p = _vint(data, p)
             _unp, p = _vint(data, p)

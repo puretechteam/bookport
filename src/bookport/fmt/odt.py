@@ -101,13 +101,23 @@ def _meta(z) -> Metadata:
     md.title = t("dc", "title")
     creator = t("meta", "initial-creator") or t("dc", "creator")
     if creator:
-        md.authors = [creator]
+        md.authors = [a.strip() for a in creator.split(";") if a.strip()]  # bookport joins them with "; "
     md.description = t("dc", "description")
     if t("dc", "subject"):
         md.subjects.append(t("dc", "subject"))
     md.subjects += [" ".join((k.text or "").split()) for k in meta.findall(q("meta", "keyword")) if k.text]
+    md.subjects = list(dict.fromkeys(md.subjects))  # the subject is usually among the keywords too
     md.language = t("dc", "language")
     md.date = t("meta", "creation-date")[:10] or t("dc", "date")[:10]
+    user = {el.get(q("meta", "name")): " ".join((el.text or "").split()) for el in meta.findall(q("meta", "user-defined"))}
+    md.publisher = user.get("Publisher", "")
+    if user.get("ISBN"):
+        md.identifiers["isbn"] = user["ISBN"]
+    md.series = user.get("Series", "")
+    try:
+        md.series_index = float(user["Series index"]) if user.get("Series index") else None
+    except ValueError:
+        pass
     return md
 
 
@@ -174,7 +184,7 @@ class _Converter:
             tag = c.tag
             if tag == q("text", "h"):
                 level = c.get(q("text", "outline-level")) or "1"
-                level = min(int(level) if level.isdigit() else 1, 6)
+                level = min(markup.whole(level) or 1, 6)
                 if level == 1 and parent is self.body and self.size > 20000:
                     self.new_doc()
                     parent = self.body
@@ -250,8 +260,8 @@ class _Converter:
                             td = ET.SubElement(tr, "th" if id(row) in head else "td")
                             for attr, name in (("number-columns-spanned", "colspan"), ("number-rows-spanned", "rowspan")):
                                 span = cell.get(q("table", attr))
-                                if span and span.isdigit() and int(span) > 1:
-                                    td.set(name, span)
+                                if (markup.whole(span) or 0) > 1:
+                                    td.set(name, str(markup.whole(span)))
                             self.blocks(cell, td)
                             # a cell with one paragraph needn't keep its <p>
                             if len(td) == 1 and td[0].tag == "p" and not (td.text or "").strip():
@@ -284,7 +294,8 @@ class _Converter:
                 self.inline(c, a)
             elif tag == q("text", "s"):
                 n = c.get(q("text", "c"), "1")
-                markup.append_text(target, " " * (int(n) if n.isdigit() else 1))
+                count = markup.whole(n)
+                markup.append_text(target, " " * (1 if count is None else min(count, 10_000)))
             elif tag == q("text", "tab"):
                 markup.append_text(target, "\t")
             elif tag == q("text", "line-break"):
@@ -711,7 +722,13 @@ def write(book: Book, path, **_) -> None:
     if md.subjects:
         meta.append(f"<dc:subject>{_x(md.subjects[0])}</dc:subject>")
         meta += [f"<meta:keyword>{_x(s)}</meta:keyword>" for s in md.subjects]
-    meta.append(f"<meta:creation-date>{now}</meta:creation-date><dc:date>{now}</dc:date>")
+    day = re.fullmatch(r"(\d{4})(?:-(\d\d))?(?:-(\d\d))?", md.date or "")
+    created = f"{day[1]}-{day[2] or '01'}-{day[3] or '01'}T00:00:00" if day else now  # the book's own date
+    meta.append(f"<meta:creation-date>{created}</meta:creation-date><dc:date>{now}</dc:date>")
+    for name, value in (("Publisher", md.publisher), ("ISBN", md.identifiers.get("isbn", "")), ("Series", md.series),
+                        ("Series index", f"{md.series_index:g}" if md.series and md.series_index is not None else "")):
+        if value:
+            meta.append(f'<meta:user-defined meta:name="{name}">{_x(value)}</meta:user-defined>')
     meta_xml = (f'<?xml version="1.0" encoding="UTF-8"?>\n<office:document-meta {_ROOT_NS} office:version="1.3">'
                 f"<office:meta>{''.join(meta)}</office:meta></office:document-meta>")
     styles = (f'<?xml version="1.0" encoding="UTF-8"?>\n<office:document-styles {_ROOT_NS} office:version="1.3">'

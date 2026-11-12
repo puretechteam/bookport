@@ -15,14 +15,61 @@ from pathlib import Path
 from .. import markup, mathml
 from ..book import Book, Metadata, is_external, relative, resolve
 from ..limits import safe_path
-from ..textwriter import is_note, is_noteref
+from ..textwriter import _split_space, is_note, is_noteref, number, table_rows
+
+_EMPH_MARKS = {"em": "*", "i": "*", "cite": "*", "dfn": "*", "var": "*", "strong": "**", "b": "**", "del": "~~",
+               "s": "~~", "strike": "~~"}
 
 # --- reading -----------------------------------------------------------------------------------
 
 _HR = re.compile(r"^ {0,3}([-*_])(\s*\1){2,}\s*$")
-_ATX = re.compile(r"^ {0,3}(#{1,6})(?:[ \t]+(.*?))?(?:[ \t]+#+)?[ \t]*$")
 _SETEXT = re.compile(r"^ {0,3}(=+|-+)\s*$")
-_FENCE = re.compile(r"^( {0,3})(`{3,}|~{3,})\s*(\{[^{}`]*\}|[^`\s]*)[^`]*$")
+
+
+class _Groups:
+    """A match's groups, for line tests done partly in code: regexes for them that leave the end of the
+    line to a few overlapping \\s* and .*? tried every split of a long run of spaces (seconds on 20 KB)."""
+
+    __slots__ = ("_g",)
+
+    def __init__(self, *groups):
+        self._g = groups
+
+    def group(self, k: int):
+        return self._g[k]
+
+
+_ATX_LINE = re.compile(r"^ {0,3}(#{1,6})(?=[ \t]|$)(.*)$")
+_FENCE_LINE = re.compile(r"^( {0,3})(`{3,}|~{3,})(.*)$")
+_FENCE_INFO = re.compile(r"\{[^{}`]*\}|[^`\s]*")
+
+
+class _AtxMatcher:
+    @staticmethod
+    def match(line: str) -> _Groups | None:
+        """An ATX heading: group(1) the #s, group(2) the text without the closing #s (None when empty)."""
+        m = _ATX_LINE.match(line)
+        if m is None:
+            return None
+        text = m.group(2).strip()
+        bare = text.rstrip("#")
+        if bare != text and (not bare or bare[-1] in " \t"):
+            text = bare.rstrip()
+        return _Groups(line, m.group(1), text or None)
+
+
+class _FenceMatcher:
+    @staticmethod
+    def match(line: str) -> _Groups | None:
+        """A code fence: group(1) its indent, group(2) the fence, group(3) the info word."""
+        m = _FENCE_LINE.match(line)
+        if m is None or "`" in m.group(3):
+            return None
+        return _Groups(line, m.group(1), m.group(2), _FENCE_INFO.match(m.group(3).lstrip()).group(0))
+
+
+_ATX = _AtxMatcher()
+_FENCE = _FenceMatcher()
 _BULLET = re.compile(r"^( {0,3})([-*+])( +|\t|$)(.*)$")
 _ORDERED = re.compile(r"^( {0,3})(\(?(?:\d{1,9}|#|[ivxlcdm]{1,8}|[IVXLCDM]{1,8}|[a-zA-Z]))([.)])( +|\t|$)(.*)$")
 _ROMAN = re.compile(r"^m{0,4}(?:cm|cd|d?c{0,3})(?:xc|xl|l?x{0,3})(?:ix|iv|v?i{0,3})$")
@@ -44,7 +91,7 @@ def _ordered(line: str) -> re.Match | None:
     return m
 
 
-def _marker_kind(mark: str, first: bool = True) -> tuple[str, int]:
+def _marker_kind(mark: str) -> tuple[str, int]:
     """(list type: "1", "a", "A", "i", "I"; the number) for a list marker."""
     mark = mark.lstrip("(")
     if mark.isdigit():
@@ -82,14 +129,25 @@ _REFDEF = re.compile(r"""^ {0,3}\[([^\]]+)\]:\s*<?([^\s>]+)>?(?:\s+(?:"([^"]*)"|
 _HTML_BLOCK = re.compile(r"^ {0,3}<(/?)(address|article|aside|blockquote|body|center|details|dialog|dd|div|dl|dt|"
                          r"fieldset|figcaption|figure|footer|form|h[1-6]|header|hr|html|li|main|nav|ol|p|pre|section|"
                          r"table|tbody|td|tfoot|th|thead|tr|ul|!--|script|style)(\s|/?>|$)", re.IGNORECASE)
-_TABLE_SEP = re.compile(r"^\s*\|?\s*:?-+:?\s*(\|\s*:?-+:?\s*)*\|?\s*$")
+_SEP_CELL = re.compile(r":?-+:?")
+
+
+class _TableSepMatcher:
+    @staticmethod
+    def match(line: str) -> bool:
+        """A pipe table's separator line (| --- | :-: |), tested a cell at a time."""
+        s = line.strip().removeprefix("|").removesuffix("|")
+        cells = s.split("|")
+        return bool(s.strip()) and all(_SEP_CELL.fullmatch(c.strip()) for c in cells)
+
+
+_TABLE_SEP = _TableSepMatcher()
 # Pandoc's Markdown
-_DIV_OPEN = re.compile(r"^ {0,3}:{3,}\s*(\{[^{}\n]*\}|[\w-]+)\s*:*\s*$")
+_DIV_OPEN = re.compile(r"^ {0,3}:{3,}[ \t]*(\{[^{}\n]*\}|[\w-]+)[ \t]*(?::+[ \t]*)?$")
 _DIV_CLOSE = re.compile(r"^ {0,3}:{3,}\s*$")
 _TAGS_LINE = re.compile(r"^\s*(?:<[^<>]+>\s*)+$")
 _LINE_BLOCK = re.compile(r"^\|(?: (.*)|$)")
 _DEF_ITEM = re.compile(r"^( {0,3}[:~](?: +|\t))(\S.*)$")
-_DASHES = re.compile(r"^\s*-+(?:\s+-+)*\s*$")
 _COLUMNS = re.compile(r"^\s*-+(?:\s+-+)+\s*$")  # two or more runs of dashes: a table's columns
 _ONE_DASH_RUN = re.compile(r"^\s*-{3,}\s*$")
 _GRID_RULE = re.compile(r"^\s*\+[-=:]+(?:\+[-=:]+)*\+\s*$")
@@ -141,7 +199,6 @@ _AUTOLINK = re.compile(r"<((?:https?|ftps?|mailto|file|info|urn|tel|data|irc|irc
                        re.IGNORECASE)
 _TEX_INLINE = re.compile(r"\\[A-Za-z]{2,30}\*?(?:\[[^\[\]\n]{0,200}\])?(?:\{[^{}\n]{0,500}\}){1,4}")
 _TEX_BEGIN = re.compile(r"^\\begin\{([A-Za-z*]{1,30})\}")
-_SMART_PIECES = re.compile("(<[^<>]*>|\x00\\d+\x00)")
 _OPENS = r"(^|[\s(\[{/\N{EM DASH}\N{EN DASH}\N{LEFT DOUBLE QUOTATION MARK}\N{LEFT SINGLE QUOTATION MARK}\x00-])"
 
 
@@ -215,8 +272,8 @@ class _Notes:
 
 
 class _Parser:
-    def __init__(self, text: str, notes: _Notes | None = None):
-        self.refs: dict[str, tuple[str, str]] = {}
+    def __init__(self, text: str, notes: _Notes | None = None, refs: dict | None = None):
+        self.refs: dict[str, tuple[str, str]] = dict(refs or {})  # [text][ref] links: the whole file's definitions
         self.depth = 0
         if notes is None:
             text, defs = _footnote_defs(text)
@@ -252,7 +309,9 @@ class _Parser:
 
         def end_para():
             if para:
-                inner = self.inline("\n".join(s.strip() for s in para))
+                # two trailing spaces are a hard line break: kept (as two) until the inline pass sees them
+                inner = self.inline("\n".join(s.strip() + ("  " if s.endswith("  ") and k < len(para) - 1 else "")
+                                              for k, s in enumerate(para)))
                 # an image alone in its paragraph is a figure, its alt text the caption (Pandoc's implicit_figures)
                 fig = re.fullmatch(r'\s*<img [^>]*\balt="([^"]+)"[^>]*/>\s*', inner)
                 out.append(f"<figure>{inner.strip()}<figcaption>{fig.group(1)}</figcaption></figure>" if fig
@@ -401,7 +460,7 @@ class _Parser:
         if _GRID_RULE.match(line) and i + 1 < n and lines[i + 1].lstrip().startswith("|"):
             return self._grid_table(lines, i, out)
         if _COLUMNS.match(nxt) and "|" not in line:
-            return self._simple_table(lines, i, out, headless=False)
+            return self._simple_table(lines, i, out)
         return i
 
     def _line_block(self, lines: list[str], i: int, out: list[str]) -> int:
@@ -500,7 +559,7 @@ class _Parser:
         out.append("".join(parts))
         return i
 
-    def _simple_table(self, lines: list[str], i: int, out: list[str], headless: bool) -> int:
+    def _simple_table(self, lines: list[str], i: int, out: list[str]) -> int:
         """A heading line over runs of dashes, then one row per line up to a blank line."""
         n = len(lines)
         cols = [(m.start(), m.end()) for m in re.finditer(r"-+", lines[i + 1])]
@@ -808,9 +867,9 @@ class _Parser:
 
         for _ in range(3):  # nested brackets (an image inside a link)
             text = re.sub(r"!\[([^\[\]]*)\]\(([^()\s]*(?:\s+&quot;[^&]*&quot;)?(?:\s+\"[^\"]*\")?)\)",
-                          lambda m: link(_unq(m), True), text)
+                          lambda m: link(m, True), text)
             text = re.sub(r"\[([^\[\]]*)\]\(([^()\s]*(?:\([^()]*\)[^()\s]*)*(?:\s+\"[^\n]{0,500}?\"(?=\))|\s+'[^']*')?)\)",
-                          lambda m: link(_unq(m), False), text)
+                          lambda m: link(m, False), text)
             text = re.sub(r"!\[([^\[\]]+)\](?:\[([^\[\]]*)\])?", lambda m: reflink(m, True), text)
             text = re.sub(r"\[([^\[\]]+)\](?:\[([^\[\]]*)\])?", lambda m: reflink(m, False), text)
             # Pandoc's bracketed spans: [text]{#id .class}
@@ -825,7 +884,7 @@ class _Parser:
             text = re.sub(r"(<[^<>]*>)|(?<!~)~((?:[^\s~<>]|<[^<>]*>){1,200}?)~(?!~)|\^((?:[^\s^<>]|<[^<>]*>){1,200}?)\^",
                           lambda m: m.group(1) or (f"<sub>{m.group(2)}</sub>" if m.group(2) else f"<sup>{m.group(3)}</sup>"),
                           text)
-        text = re.sub(r"( {2,}|\\)\n", "<br/>\n", text)
+        text = re.sub(r"(?<! ) {2,}\n|\\\n", "<br/>\n", text)  # tried once per run of spaces, not once per space
         if any(c in text for c in "\"'-."):
             text = _smart(text)
         text = re.sub(r"\x00(\d+)\x00", lambda m: placeholders[int(m.group(1))], text)
@@ -869,9 +928,6 @@ def _math(tex: str, display: bool) -> str:
     return markup.to_string(mathml.from_tex(tex.strip(), display))
 
 
-def _unq(m):
-    return m
-
 
 def _strip_tags(s):
     return re.sub(r"<[^>]+>|\x00\d+\x00", "", s)
@@ -906,10 +962,11 @@ def book_from_markdown(text: str, title: str = "", base_dir: Path | None = None,
     # anywhere, so their definitions are taken out of the whole text first
     text, defs = _footnote_defs(text)
     notes = _Notes(defs)
+    refs = _Parser(text, notes).refs  # link definitions too: they usually sit at the end, after every chapter
     chunks = _split_chapters(text)
     for n, chunk in enumerate(chunks, 1):
         notes.current = f"part{n:04d}.xhtml"
-        body_html = _Parser(chunk, notes).html()
+        body_html = _Parser(chunk, notes, refs).html()
         root = markup.parse(f'<html xmlns:epub="{markup.EPUB_NS}"><head><title>{html.escape(book.metadata.title)}</title>'
                             f"</head><body>{body_html}</body></html>")
         href = f"text/part{n:04d}.xhtml"
@@ -1094,6 +1151,9 @@ class _Writer:
     def block(self, el, depth) -> str:
         tag = el.tag
         anchor = self._anchors(el)
+        # before a fence, list, quote or table the anchor is a line of its own: in front of the first line it
+        # turned a list's first item into text and kept a fence from opening
+        own_line = anchor + "\n\n" if anchor else ""
         if tag in ("h1", "h2", "h3", "h4", "h5", "h6"):
             text = " ".join(self.inline_children(el).split())
             return f"{'#' * int(tag[1])} {anchor}{text}" if text else anchor
@@ -1105,13 +1165,13 @@ class _Writer:
         if tag == "pre":
             code = markup.text_of(el)
             fence = "~~~" if "```" in code else "```"
-            return f"{anchor}{fence}\n{code.rstrip()}\n{fence}"
+            return f"{own_line}{fence}\n{code.rstrip()}\n{fence}"
         if tag == "blockquote":
             inner = self.blocks(el, depth)
-            return anchor + "\n".join("> " + line if line else ">" for line in inner.split("\n"))
+            return own_line + "\n".join("> " + line if line else ">" for line in inner.split("\n"))
         if tag in ("ul", "ol"):
             items = []
-            n = int(el.get("start", "1")) if el.get("start", "1").isdigit() else 1
+            n = number(el.get("start"), 1, 0, 999_999_999)
             for li in el:
                 if li.tag != "li":
                     continue
@@ -1122,9 +1182,9 @@ class _Writer:
                 pad = " " * (len(marker) + 1)
                 lines = inner.split("\n")
                 items.append(f"{marker} " + lines[0] + "".join("\n" + (pad + line if line else "") for line in lines[1:]))
-            return anchor + "\n".join(items)
+            return own_line + "\n".join(items)
         if tag == "table":
-            return anchor + self.table(el)
+            return own_line + self.table(el)
         if tag == "dl":
             parts = []
             for c in el:
@@ -1147,13 +1207,12 @@ class _Writer:
 
     def table(self, el) -> str:
         rows = []
-        for tr in el.iter("tr"):
+        for tr in table_rows(el):
             row = []
             for c in tr:
                 if c.tag in ("td", "th"):
                     row.append(" ".join(self.inline_children(c).split()).replace("|", "\\|"))
-                    span = c.get("colspan", "1")
-                    row += [""] * (min(int(span), 50) - 1 if span.isdigit() and int(span) > 1 else 0)
+                    row += [""] * (number(c.get("colspan"), 1, 1, 50) - 1)
             rows.append(row)
         caption = el.find("caption")
         caption = _wrap_lines(self.inline_children(caption).strip()) + "\n\n" if caption is not None else ""
@@ -1173,7 +1232,7 @@ class _Writer:
         return "".join(out)
 
     def _text(self, s: str) -> str:
-        return _esc(re.sub(r"\s+", " ", s))
+        return _esc(re.sub(r"[ \t\r\n\f]+", " ", s))  # not \s: no-break spaces are text
 
     def inline_el(self, el) -> str:
         tag = el.tag if isinstance(el.tag, str) else ""
@@ -1181,21 +1240,17 @@ class _Writer:
         if tag in ("script", "style", "head"):
             return ""
         if tag == "br":
-            return "  \n"
+            return "\\\n"  # a backslash break: two trailing spaces would be stripped with the line
         if tag == "math":
             tex = " ".join(re.sub(r"(?<!\\)%[^\n]*", "", mathml.to_tex(el)).split())
             if not tex:
                 return ""
             return anchor + (f"$${tex}$$" if el.get("display") == "block" else f"${tex}$")
-        if tag in ("em", "i", "cite", "dfn", "var"):
-            inner = self.inline_children(el)
-            return anchor + (f"*{inner.strip()}*" if inner.strip() else inner)
-        if tag in ("strong", "b"):
-            inner = self.inline_children(el)
-            return anchor + (f"**{inner.strip()}**" if inner.strip() else inner)
-        if tag in ("del", "s", "strike"):
-            inner = self.inline_children(el)
-            return anchor + (f"~~{inner.strip()}~~" if inner.strip() else inner)
+        mark = _EMPH_MARKS.get(tag)
+        if mark:
+            # the spaces at its edges go outside the marks: "word<em> italic</em>" became "word*italic*"
+            lead, core, trail = _split_space(self.inline_children(el))
+            return anchor + (lead + mark + core + mark + trail if core else lead)
         if tag in ("code", "kbd", "samp", "tt"):
             code = markup.text_of(el)
             tick = "``" if "`" in code else "`"
@@ -1221,9 +1276,13 @@ class _Writer:
             name = self.used_images.get(target)
             if name is None:
                 base = re.sub(r"[^\w.-]", "_", target.split("/")[-1])
-                name = f"{self.image_dir}/{base}"
-                while name in self.used_images.values():
-                    name = f"{self.image_dir}/{len(self.used_images)}_{base}"
+                if not base.strip("."):
+                    base = "picture"
+                taken = set(self.used_images.values())
+                name, n = f"{self.image_dir}/{base}", 0
+                while name in taken:
+                    n += 1
+                    name = f"{self.image_dir}/{n}_{base}"
                 self.used_images[target] = name
             alt = el.get("alt", "")
             return anchor + f"![{_esc(alt)}]({name})"
@@ -1268,8 +1327,8 @@ def book_to_markdown(book: Book, image_dir: str = "images") -> tuple[str, dict[s
             parts.append(doc)
     if w.note_texts:
         parts.append(w.footnotes())
-    text = "\n\n".join(parts) + "\n"
-    text = re.sub(r"\n{3,}", "\n\n", text)
+    # blank lines inside a part (a code block's) stay as they are
+    text = "\n\n".join(p.strip("\n") for p in parts) + "\n"
     return text, w.used_images
 
 

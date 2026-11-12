@@ -19,12 +19,14 @@ from pathlib import Path
 from .. import bib, markup, mathml
 from ..bib import ACCENTS, SYMBOLS, accent, ligatures
 from ..book import Book, Metadata, is_external, relative, resolve, sniff_image
-from ..limits import safe_path
+from ..errors import BookportError
+from ..limits import LimitError, safe_path
 from ..textwriter import Cell, Table, TextWriter, is_noteref, write_text
 
 MAX_NEST = 60  # arguments inside arguments read one in another; deeper ones are read flat
 MAX_EXPANSIONS = 200_000  # macro expansions for one document
 MAX_EXPANDED = 4_000_000  # tokens macros may produce for one document
+MAX_COLUMNS = 1000  # columns a tabular's spec may ask for
 MAX_INCLUDE_DEPTH = 16
 MAX_INCLUDES = 1000
 MAX_SOURCE = 64 * 1024 * 1024  # characters read for one document, includes and all
@@ -518,6 +520,7 @@ class _Reader:
         self.pictures_refused: list[str] = []
         self.drawings = 0
         self.ids: set[str] = set()
+        self.id_next: dict[str, int] = {}
         self.lang = ""
         self.keywords: list[str] = []
         self.column_types: dict[str, str] = {}
@@ -633,7 +636,8 @@ class _Reader:
         pos = vm.end()
         lang = ""
         if name == "minted":
-            om = re.compile(r"\s*(?:\[[^\]\n]*\])?\s*\{([^}\n]*)\}").match(text, pos)
+            # spaces once only before the options (two \s* side by side split long runs every way)
+            om = re.compile(r"\s*(?:\[[^\]\n]*\]\s*)?\{([^}\n]*)\}").match(text, pos)
             if om:
                 lang, pos = om.group(1), om.end()
         elif text.startswith("[", pos):
@@ -755,11 +759,15 @@ class _Reader:
                 return t
             self.expand(m)
 
+    def _expansion_stop(self) -> None:
+        if not self.expansion_capped:
+            self.lost.append("Macros expanded too many times (a macro that calls itself?); the rest were left as they are")
+        self.expansion_capped = True
+
     def expand(self, m: _Macro) -> None:
         self.expansions += 1
         if self.expansions > MAX_EXPANSIONS or self.expanded > MAX_EXPANDED:
-            self.expansion_capped = True
-            self.lost.append("Macros expanded too many times (a macro that calls itself?); the rest were left as they are")
+            self._expansion_stop()
             return
         args: list[list] = []
         if m.nargs:
@@ -953,10 +961,10 @@ class _Reader:
         self.wrap_of[id(outer)] = (style, inner)
         return inner
 
-    def text(self, s: str) -> None:
+    def text(self, s: str, lig: bool = True) -> None:
         if not s:
             return
-        if not self.code:
+        if not self.code and lig:
             s = ligatures(s)
         f = self.frames[-1]
         if (f.block and f.para is None or f.kind == "list") and not s.strip():
@@ -1016,10 +1024,11 @@ class _Reader:
         base = re.sub(r"[^A-Za-z0-9_.-]", "-", key) or "x"
         if not re.match(r"[A-Za-z_]", base):
             base = "l-" + base
-        i, n = base, 1
+        i, n = base, self.id_next.get(base, 1)  # on from the last number given, not from 1 each time
         while i in self.ids:
             n += 1
             i = f"{base}-{n}"
+        self.id_next[base] = n
         self.ids.add(i)
         return i
 
@@ -1034,6 +1043,18 @@ class _Reader:
                     return
                 k = t[0]
                 if k == "tx":
+                    # the text tokens that follow in the same list, added in one go: a macro that doubles
+                    # its argument made millions of one-letter tokens, each joined to the text so far
+                    st = self.stream.stack
+                    if st:
+                        lst, i = st[-1]
+                        j = i
+                        while j < len(lst) and lst[j][0] == "tx":
+                            j += 1
+                        if j > i:
+                            st[-1][1] = j
+                            self.text(t[1] + "".join(x[1] for x in lst[i:j]))
+                            continue
                     self.text(t[1])
                 elif k == "sp":
                     f = self.frames[-1]
@@ -1052,7 +1073,7 @@ class _Reader:
                     if h is not None:
                         h(name)
                     elif name in SYMBOLS:
-                        self.text(SYMBOLS[name])
+                        self.text(SYMBOLS[name], lig=False)  # \textasciigrave is a backtick, not an opening quote
                     elif name in IGNORE:
                         self.skip_args(IGNORE[name])
                     elif name in TRANSPARENT:
@@ -1107,6 +1128,12 @@ class _Reader:
         """``\\end`` of something that isn't the environment being read: True to stop reading this one."""
         d = self.envdefs.get(envname)
         if d is not None and envname not in PROTECTED_ENVS:
+            # counted like any expansion: an environment whose end code ends itself looped forever
+            self.expansions += 1
+            if self.expansions > MAX_EXPANSIONS or self.expanded > MAX_EXPANDED:
+                self._expansion_stop()
+                return False
+            self.expanded += len(d[3])
             self.stream.push(d[3])
             return False
         if envname == "document":
@@ -1246,9 +1273,12 @@ class _Reader:
                 while len(args) < nargs:
                     args.append(self.read_arg())
             self.expansions += 1
-            if self.expansions > MAX_EXPANSIONS:
+            if self.expansions > MAX_EXPANSIONS or self.expanded > MAX_EXPANDED:
+                self._expansion_stop()
                 return
-            self.stream.push(_subst(b, args))
+            body = _subst(b, args)
+            self.expanded += len(body)
+            self.stream.push(body)
             return
         if env == "document":
             self.start_document()
@@ -1364,9 +1394,10 @@ class _Reader:
             span = ET.SubElement(h, "span", {"class": "header-section-number"})
             span.text = number
             span.tail = " "
-        self.into(h, toks)
-        self.headings.append((h, level))
         kind = "appendix" if self.appendix and name == ("chapter" if self.chapters else "section") else name
+        self.headings.append((h, level))
+        self.label_target = (h, number or self._current_sec(), kind)  # before the text: \section{Title\label{x}}
+        self.into(h, toks)
         self.label_target = (h, number or self._current_sec(), kind)
 
     def step_section(self, name: str) -> str:
@@ -1466,7 +1497,7 @@ class _Reader:
         self.text(accent(name, base))
 
     def today(self, name: str) -> None:
-        d = date.today()  # noqa: DTZ011 - \today is the local date, as LaTeX prints it
+        d = date.today()
         self.text(f"{d:%B} {d.day}, {d.year}")
 
     def enquote(self, name: str) -> None:
@@ -2377,8 +2408,8 @@ class _Reader:
         tb = self.tables[-1] if self.tables else None
         if tb is not None and tb.cell is not None and self.frames[-1] is tb.frame:
             try:
-                span = abs(int(float(n)))
-            except ValueError:
+                span = min(abs(int(float(n))), 65534)
+            except (ValueError, OverflowError):  # "x", "nan", "1e400"
                 span = 1
             if span > 1:
                 tb.cell.set("rowspan", str(min(span, 500)))
@@ -2630,8 +2661,8 @@ class _Reader:
         self.star()
         opts = self.read_optional()
         self.read_optional()
-        raw = self.arg_text() if name not in ("epsfig", "psfig") else ""
-        if name in ("epsfig", "psfig"):
+        raw = self.arg_text()
+        if name in ("epsfig", "psfig"):  # \epsfig{file=name,width=...}
             m = re.search(r"(?:file|figure)\s*=\s*([^,}]+)", raw or "")
             raw = m.group(1) if m else ""
         src = raw.strip().strip('"').replace("{", "").replace("}", "")
@@ -2639,8 +2670,8 @@ class _Reader:
             return
         img = ET.Element("img", {"src": src, "alt": ""})
         o = detok(opts) if opts else ""
-        wm = re.search(r"width\s*=\s*([\d.]*)\s*\\(?:textwidth|linewidth|columnwidth|hsize)", o)
-        if wm:
+        wm = re.search(r"width\s*=\s*(\d*\.?\d*)\s*\\(?:textwidth|linewidth|columnwidth|hsize)", o)
+        if wm and wm.group(1) != ".":  # "width=.\textwidth" (or 1.2.3) is no number: the picture keeps its size
             frac = float(wm.group(1) or 1)
             img.set("style", f"width: {min(100, round(frac * 100))}%")
         self.place_picture(img, src)
@@ -2676,6 +2707,10 @@ class _Reader:
             return
         rel = found.name
         img.set("src", rel)
+        if sniff_image(data) is None and _postscript(found.name, data):
+            svg = self.eps_figure(rel, data)
+            if svg is not None:  # drawn as SVG, which books can hold
+                found, data = found.with_name(found.stem + ".svg"), svg
         if sniff_image(data) is None:
             self.pictures_vector.append(rel)
             img.set("alt", rel)
@@ -2688,6 +2723,20 @@ class _Reader:
         if existing is None:
             existing = self.book.add("images/" + re.sub(r"[^\w.-]", "_", found.name), data).href
         img.set("src", "../" + existing)
+
+    def eps_figure(self, rel: str, data: bytes) -> bytes | None:
+        """An EPS or PostScript figure as SVG (text as glyph outlines), or None when it can't be drawn."""
+        from .. import ps
+        notes: list[str] = []
+        try:
+            svg = ps.to_svg(data, notes=notes)
+        except LimitError:
+            raise
+        except BookportError as e:
+            self.lost.append(f"The PostScript figure {rel} couldn't be drawn: {e}")
+            return None
+        self.lost += [f"{rel}: {n}" for n in notes]
+        return svg
 
     def inputlisting(self, name: str) -> None:
         opts = self.read_optional()
@@ -2729,7 +2778,7 @@ class _Reader:
         if cmd == "href":
             self.into(a, self.read_arg())
         else:
-            a.text = raw.strip()
+            a.text = url  # shown as the address it is: \url{x/\%7E} showed the backslash, and got more each round trip
             a.set("class", "uri")
 
     # --- math ----------------------------------------------------------------------------------------
@@ -2941,7 +2990,8 @@ class _Reader:
                 w = th["within"]
                 prefix = (self._sec_number(w) if w in _SEC_ORDER and w != "part" else str(self.counters[w])) + "."
             number = prefix + str(self.counters[key])
-        div = self.add_block("div", {"class": env.rstrip("*")})
+        # data-theorem marks it for the writer, which then knows it from any other div with one class
+        div = self.add_block("div", {"class": env.rstrip("*"), "data-theorem": "numbered" if number else "unnumbered"})
         f = self.push_frame(div, True, "theorem")
         p = ET.SubElement(div, "p")
         f.para = p
@@ -3060,6 +3110,14 @@ class _Reader:
         first = self.read_optional()
         second = self.read_optional()
         keys = [k.strip() for k in self.arg_text().split(",") if k.strip()]
+        if name.endswith("cites"):  # biblatex's \cites[pre][post]{a}[pre][post]{b}...: every key group
+            while True:
+                t = self.stream.peek()
+                if t is None or not (t[0] == "{" or t == LBRACK):
+                    break
+                self.read_optional()
+                self.read_optional()
+                keys += [k.strip() for k in self.arg_text().split(",") if k.strip()]
         mode = CITES[name]
         pre, post = "", ""
         if second is not None:
@@ -3177,7 +3235,7 @@ class _Reader:
         numeric = self._cite_style() == "numeric"
         if opt is not None:
             label = " ".join(self.plain(opt).split())
-            m = re.match(r"^(.*?)\s*\((.*?)\)(.*)$", label, re.DOTALL)
+            m = re.match(r"^([^()]*)\(([^()]*)\)(.*)$", label, re.DOTALL)  # [Author(Year)...]: no backtracking over "("
             if m and not numeric:
                 e.short, e.year = m.group(1).strip(), m.group(2).strip()
                 entry.set("data-short", e.short)
@@ -3303,7 +3361,11 @@ def _colspec(spec: str, custom: dict[str, str] | None = None, depth: int = 0) ->
                 except ValueError:
                     k = 1
                 if depth < 4:
-                    out += _colspec(inner, custom, depth + 1) * k
+                    part = _colspec(inner, custom, depth + 1)
+                    # repeats inside repeats multiply: bounded, *{100}{*{100}{...}} asked for 10^8 columns
+                    out += part * min(k, (MAX_COLUMNS - len(out)) // max(1, len(part)) + 1)
+                    if len(out) >= MAX_COLUMNS:
+                        return out[:MAX_COLUMNS]
                 i = e2 + 1
                 continue
             i = e1 + 1
@@ -3638,6 +3700,12 @@ def _resolve_refs(book: Book, r: _Reader) -> None:
         book.set_tree(href, book.tree(href))
 
 
+def _postscript(name: str, data: bytes) -> bool:
+    """An EPS or PostScript figure (by its name, or a DOS EPS header or %! at its start)."""
+    return (name.lower().endswith((".eps", ".ps", ".epsi", ".epsf")) or data[:4] == bytes((0xC5, 0xD0, 0xD3, 0xC6))
+            or data.lstrip()[:2] == b"%!")
+
+
 def _lost(book: Book, r: _Reader) -> None:
     lost = list(dict.fromkeys(r.lost))
     if r.unknown_cmds:
@@ -3651,7 +3719,8 @@ def _lost(book: Book, r: _Reader) -> None:
         lost.append(f"Drawings made with TikZ or the picture environment can't be converted and were left out: "
                     f"{r.drawings}")
     if r.pictures_vector:
-        lost.append("Pictures in PDF or EPS form can't go into a book; their places and captions are kept: "
+        lost.append("Pictures in PDF form (or PostScript that couldn't be drawn) can't go into a book; their places "
+                    "and captions are kept: "
                     + ", ".join(dict.fromkeys(r.pictures_vector)))
     if r.pictures_missing:
         lost.append("Pictures not found: " + ", ".join(dict.fromkeys(r.pictures_missing)))
@@ -3688,15 +3757,17 @@ for _g, _n in _GREEK.items():
 _UNICODE = {c: "\\ensuremath{" + v[2:-2] + "}" for c, v in _ESCAPES.items() if v.startswith("\\(")}
 for _c in _UNICODE:
     del _ESCAPES[_c]
-_ESC_RE = re.compile("[" + re.escape("".join(_ESCAPES)) + "]|--|``|''|(?<=\\w)'(?=')|-(?=-)")
+# a hyphen or quote before another gets {} so TeX makes no dash or quote ligature of them ("a---b" was
+# written a-{}--b and read back with an en dash); a backtick is no quote mark here
+_ESC_RE = re.compile("[" + re.escape("".join(_ESCAPES)) + "]|-(?=-)|'(?=')|`")
 _REF_KINDS = {"ref": "ref", "eqref": "eqref", "autoref": "autoref", "cref": "cref", "Cref": "Cref",
               "nameref": "nameref"}
 
 
 def escape(s: str) -> str:
     """Text for LaTeX: the special characters, and the ligatures TeX would make (-- `` '')."""
-    return _ESC_RE.sub(lambda m: _ESCAPES.get(m.group(0)) or {"--": "-{}-", "``": "`{}`", "''": "'{}'"}.get(
-        m.group(0), m.group(0) + "{}"), s)
+    return _ESC_RE.sub(lambda m: _ESCAPES.get(m.group(0)) or ("\\textasciigrave{}" if m.group(0) == "`" else
+                                                              m.group(0) + "{}"), s)
 
 
 def _url(s: str) -> str:
@@ -3774,9 +3845,6 @@ class _LatexWriter(TextWriter):
         lines.append("\\end{thebibliography}")
         return "\n\n".join(lines)
 
-    def join_document(self, parts: list[str]) -> str:
-        return re.sub(r"\n{3,}", "\n\n", "\n\n".join(parts)).strip("\n") + "\n"
-
     def document_head(self) -> str:
         md = self.book.metadata
         lines = ["\\documentclass{article}", "\\usepackage[T1]{fontenc}", "\\usepackage[utf8]{inputenc}",
@@ -3799,7 +3867,8 @@ class _LatexWriter(TextWriter):
         if "theorem" in self.uses:
             lines.append("\\usepackage{amsthm}")
             for env, name in self.theorems.items():
-                lines.append(f"\\newtheorem{{{env}}}{{{escape(name)}}}")
+                star = "*" if env.endswith("*") else ""  # \newtheorem*{remark*}{Remark}: like align*, a name of its own
+                lines.append(f"\\newtheorem{star}{{{env}}}{{{escape(name)}}}")
         lines += ["\\usepackage[hidelinks]{hyperref}"]
         if not self.numbered:
             lines.append("\\setcounter{secnumdepth}{-2}")
@@ -3854,7 +3923,9 @@ class _LatexWriter(TextWriter):
             return self.references(el)
         if tag == "div" and "table-float" in cls:
             return self.blocks(el)
-        if tag == "div" and len(cls) == 1:
+        # a theorem only when the LaTeX reader made it one, or its class names one: a book's
+        # <div class="calibre1"><p><em>Hope</em> is...</p></div> is a paragraph, not \newtheorem{calibre}
+        if tag == "div" and len(cls) == 1 and (el.get("data-theorem") or cls[0] in _FALLBACK_THEOREMS):
             th = _theorem_head(el)
             if th is not None:
                 return self.theorem(el, cls[0], *th)
@@ -3866,8 +3937,11 @@ class _LatexWriter(TextWriter):
             self.table_anchor = self.anchor_key(el)
         return super().block(el)
 
-    def theorem(self, el: ET.Element, cls: str, name: str, note: ET.Element | None, body: ET.Element) -> str:
+    def theorem(self, el: ET.Element, cls: str, name: str, note: ET.Element | None, body: ET.Element,
+                numbered: bool = True) -> str:
         env = re.sub(r"[^A-Za-z]", "", cls) or "theorem"
+        if el.get("data-theorem") == "unnumbered" or not numbered:
+            env += "*"  # \newtheorem*: "Remark." reads back as "Remark.", not "Remark 1."
         self.uses.add("theorem")
         if env not in self.theorems:
             self.theorems[env] = name
@@ -4415,4 +4489,4 @@ def _theorem_head(el: ET.Element):
                 q[-1].tail = (q[-1].tail or "") + (em.tail or "")
             else:
                 q.text += em.tail or ""
-    return m.group(1), note, body
+    return m.group(1), note, body, m.group(2) is not None

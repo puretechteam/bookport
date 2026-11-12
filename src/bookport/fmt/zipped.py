@@ -29,9 +29,9 @@ def extracted(path):
             if info.is_dir() or norm.startswith(("../", "/")) or norm == ".." or ":" in norm:
                 continue
             dest = root / norm
-            dest.parent.mkdir(parents=True, exist_ok=True)
             data = limits.zip_read(z, info)
             try:
+                dest.parent.mkdir(parents=True, exist_ok=True)  # fails where a file has the folder's name
                 dest.write_bytes(data)
             except OSError as e:
                 raise BookportError(f"Can't unpack {name} from this ZIP file ({e})") from None
@@ -47,7 +47,7 @@ def apply_opf(book: Book, opf_path: Path, root: Path | None = None) -> None:
     except (OSError, BookportError):
         return
     meta_el = _find(opf, "metadata")
-    md = _read_metadata(meta_el, opf.get("version", "2.0"))
+    md = _read_metadata(meta_el)
     for field in ("title", "language", "publisher", "date", "description", "rights", "series", "title_sort", "author_sort"):
         if getattr(md, field):
             setattr(book.metadata, field, getattr(md, field))

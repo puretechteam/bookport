@@ -73,6 +73,7 @@ def from_bytes(data: bytes, title: str = "") -> Book:
         md.subjects.append(p.info["subject"])
     if p.info.get("keywords"):
         md.subjects += [k.strip() for k in re.split(r"[,;]", p.info["keywords"]) if k.strip()]
+    md.subjects = list(dict.fromkeys(md.subjects))  # the subject is usually among the keywords too
     md.description = p.info.get("doccomm", "")
     if p.info.get("company"):
         md.publisher = p.info["company"]

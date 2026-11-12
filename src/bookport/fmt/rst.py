@@ -27,6 +27,8 @@ from ..textwriter import Table, TextWriter, is_noteref, write_text
 MAX_INCLUDE_DEPTH = 8
 MAX_INCLUDE_BYTES = 64 * 1024 * 1024
 MAX_SUB_ROUNDS = 6  # substitutions inside substitutions
+MAX_SUB_NODES = 200_000  # what substitutions may add to one document, all told (elements, and text per 64 characters)
+MAX_INCLUDES = 500  # files one document may include, all told (MAX_INCLUDE_BYTES is the limit for their sizes too)
 
 # --- shared by the markup readers ---------------------------------------------------------------
 
@@ -80,6 +82,34 @@ def replace_el(parent: ET.Element, old: ET.Element, nodes) -> None:
             parent.insert(idx, x)
             idx += 1
             prev = x
+
+
+def _splice(parent: ET.Element, reps: dict) -> None:
+    """replace_el for many children of one parent at once: {child: nodes to put where it is}."""
+    kids: list[ET.Element] = []
+    text = [parent.text or ""]
+
+    def add(x) -> None:
+        if isinstance(x, str):
+            if x:
+                if kids:
+                    kids[-1].tail = (kids[-1].tail or "") + x
+                else:
+                    text[0] += x
+        else:
+            x.tail = None
+            kids.append(x)
+
+    for c in list(parent):
+        tail = c.tail or ""
+        if c in reps:
+            for x in reps[c]:
+                add(x)
+        else:
+            add(c)
+        add(tail)
+    parent[:] = kids
+    parent.text = text[0] or None
 
 
 def unwrap(parent: ET.Element, e: ET.Element) -> None:
@@ -180,8 +210,11 @@ def _split(body: ET.Element, target: int) -> list[list[ET.Element]]:
     return chunks
 
 
-def read_include(base_dir, name: str, top, lost: list[str], seen: list[Path], what: str = "An include") -> str | None:
-    """The text of a file a document includes, or None (refused, missing, too big or a loop: said in ``lost``)."""
+def read_include(base_dir, name: str, top, lost: list[str], seen: list[Path], what: str = "An include",
+                 count: dict | None = None) -> str | None:
+    """The text of a file a document includes, or None (refused, missing, too big or a loop: said in ``lost``).
+    ``count`` ({"files": 0, "bytes": 0}, one for the whole document) bounds the includes all told: depth
+    alone let a few small files that each include the next ten times pull in 10^8 copies."""
     p = safe_path(base_dir, name, top) if base_dir is not None else None
     if p is None:
         lost.append(f"{what} outside the document's folder was left out: {name}")
@@ -193,6 +226,13 @@ def read_include(base_dir, name: str, top, lost: list[str], seen: list[Path], wh
         if not p.is_file() or p.stat().st_size > MAX_INCLUDE_BYTES:
             lost.append(f"{what} that isn't there was left out: {name}")
             return None
+        if count is not None:
+            count["files"] = count.get("files", 0) + 1
+            count["bytes"] = count.get("bytes", 0) + p.stat().st_size
+            if count["files"] > MAX_INCLUDES or count["bytes"] > MAX_INCLUDE_BYTES:
+                if "The document includes more files than bookport reads; the rest were left out" not in lost:
+                    lost.append("The document includes more files than bookport reads; the rest were left out")
+                return None
         return markup.decode(p.read_bytes())
     except OSError:
         lost.append(f"{what} that can't be read was left out: {name}")
@@ -227,15 +267,17 @@ _INL = re.compile(r"""
 |(?P<lit>``)
 |(?P<strong>\*\*)
 |(?P<emph>\*)
-|(?P<role>:[A-Za-z0-9](?:[\w.+-]|:(?!:))*?:`)
+|(?P<role>:[A-Za-z0-9](?:[\w.+-]|:(?!:)){0,64}?:`)
 |(?P<interp>`)
 |(?P<tgt>_`)
 |(?P<sub>\|)
 |(?P<fn>\[(?:[0-9]+|\#[\w.:+-]*|\*|[A-Za-z][\w.:+-]*)\]__?(?!\w))
 |(?P<uri>(?<![\w.+-])(?:https?|ftp|sftp|mailto|news|irc|ssh|git|telnet|file):(?:[^\s<>\[\]`'"|\\]|\[[^\s\]]*\])+)
 |(?P<mail>(?<![\w.+@-])[\w][\w.+-]*@[\w-]+(?:\.[\w-]+)+)
-|(?P<ref>(?<![\w\\])[^\W_]+(?:[-_.:+][^\W_]+)*__?(?!\w))
+|(?P<ref>(?<![\w\\.:+-])[^\W_]+(?:[-_.:+][^\W_]+){0,32}__?(?!\w))
 """, re.VERBOSE | re.DOTALL)
+# role names and reference names are bounded, and a name can't start right after one of its own
+# separators: unbounded, each ":" of ":a:a:a..." (or "-" of "a-a-a...") began a scan to the end of the line
 _START_PRE = set("-:/'\"<([{") | set("‘“«‹‚„–—")
 _END_POST = set("-.,:;!?\\/'\")]}>") | set("’”»›–—…")
 _PAIRS = {"(": ")", "[": "]", "{": "}", "<": ">", "'": "'", '"': '"', "‘": "’", "“": "”",
@@ -332,6 +374,7 @@ class _Rst:
         self.roles: dict[str, tuple[str, str]] = {}  # custom role -> (base role, raw format)
         self.highlight = ""
         self.seen: list[Path] = []
+        self.include_count: dict[str, int] = {}  # files and bytes included, all told
         self.meta: dict[str, str] = {}
         self.headings: dict[str, ET.Element] = {}  # id -> heading, for :ref: titles and contents
         self.contents: list[tuple[ET.Element, int, bool]] = []
@@ -546,6 +589,10 @@ class _Rst:
             j -= 1
         while j < n and not lines[j].strip():
             j += 1
+        # the body lines up with the item's text: what is indented further is a literal block or a
+        # quote inside the item ("- Install::" then the code), so only text_start columns come off
+        if all(not s.strip() or len(s) - len(s.lstrip(" ")) >= text_start for s in rest):
+            return [first, *[s[text_start:] for s in rest]], j
         return [first, *_dedent(rest)], j
 
     def _fill_item(self, item: ET.Element, body: list[str], depth: int) -> None:
@@ -607,7 +654,7 @@ class _Rst:
         m = _ENUM.match(lines[i])
         fmt, seq, v = self._enum_kind(m)
         ol = el("ol")
-        start = (1 if seq == "auto" else int(v) if seq == "arabic" else _roman(v) if "roman" in seq
+        start = (1 if seq == "auto" else _int(v, 1) if seq == "arabic" else _roman(v) if "roman" in seq
                  else ord(v.lower()) - 96)
         if start != 1:
             ol.set("start", str(start))
@@ -873,7 +920,10 @@ class _Rst:
             nodes = [_unicode(" ".join([first, *body]))]
         elif kind == "date":
             import time
-            nodes = [time.strftime(args.strip() or "%Y-%m-%d")]
+            try:  # a format the platform refuses ("%Q" on Windows) is shown as written
+                nodes = [time.strftime(args.strip() or "%Y-%m-%d")]
+            except ValueError:
+                nodes = [args.strip()]
         else:
             holder = el("div")
             self.directive(kind, first, body, holder, depth, False)
@@ -1187,7 +1237,7 @@ class _Rst:
         div = el("div", class_="contents topic")
         div.append(el("p", el("strong", args.strip() or "Contents"), class_="topic-title"))
         d = opts.get("depth", "")
-        self.contents.append((div, int(d) if d.isdigit() else 99, "local" in opts))
+        self.contents.append((div, _int(d, 99), "local" in opts))
         self.emit(parent, div)
 
     def d_include(self, first, body, parent, depth, sections):
@@ -1196,7 +1246,7 @@ class _Rst:
         if name.startswith("<") and name.endswith(">"):
             self.drop("std-include", f"A docutils standard definitions file wasn't read: {name}")
             return
-        text = read_include(self.base_dirs[-1], name, self.top, self.lost, self.seen)
+        text = read_include(self.base_dirs[-1], name, self.top, self.lost, self.seen, count=self.include_count)
         if text is None:
             return
         lines = _lines(text)
@@ -1216,7 +1266,7 @@ class _Rst:
     def d_literalinclude(self, first, body, parent, depth, sections):
         args, opts, _c = _directive_parts(first, body)
         name = args.strip()
-        text = read_include(self.base_dirs[-1], name, self.top, self.lost, self.seen)
+        text = read_include(self.base_dirs[-1], name, self.top, self.lost, self.seen, count=self.include_count)
         if text is None:
             return
         lines = _slice_lines(_lines(text), opts)
@@ -1224,14 +1274,14 @@ class _Rst:
             keep: list[str] = []
             for part in opts["lines"].split(","):
                 a, _, b = part.strip().partition("-")
-                lo = int(a) if a.strip().isdigit() else 1
-                hi = (int(b) if b.strip().isdigit() else len(lines)) if _ else lo
+                lo = _int(a, 1)
+                hi = _int(b, len(lines)) if _ else lo
                 keep += lines[lo - 1:hi]
             lines = keep
         if opts.get("pyobject"):
             self.drop("pyobject", "literalinclude :pyobject: isn't supported; the whole file was included")
         if opts.get("dedent", "").isdigit():
-            k = int(opts["dedent"])
+            k = _int(opts["dedent"], 0)
             lines = [s[k:] if s[:k].strip() == "" else s.lstrip() for s in lines]
         self._code("\n".join(lines).rstrip("\n"), opts.get("language", self.highlight), parent, opts.get("caption", ""))
 
@@ -1260,7 +1310,7 @@ class _Rst:
         args, opts, content = _directive_parts(first, body)
         text = "\n".join(content)
         if opts.get("file"):
-            got = read_include(self.base_dirs[-1], opts["file"].strip(), self.top, self.lost, self.seen, "A table file")
+            got = read_include(self.base_dirs[-1], opts["file"].strip(), self.top, self.lost, self.seen, "A table file", count=self.include_count)
             text = got or ""
         elif opts.get("url"):
             self.lost.append(f"A table from the web wasn't fetched: {opts['url']}")
@@ -1283,7 +1333,7 @@ class _Rst:
                 row.append(td)
             rows.append(row)
         if header:
-            opts = {**opts, "header-rows": str(len(header) + int(opts.get("header-rows", "0") or 0))}
+            opts = {**opts, "header-rows": str(len(header) + _int(opts.get("header-rows", ""), 0))}
         self.emit(parent, self._table_from(rows, args, opts))
 
     def _table_from(self, rows: list[list[ET.Element]], title: str, opts: dict) -> ET.Element:
@@ -1291,7 +1341,7 @@ class _Rst:
         if title.strip():
             table.append(el("caption", self.inline(title.strip())))
         hr = opts.get("header-rows", "0")
-        heads = int(hr) if hr.strip().isdigit() else 0
+        heads = _int(hr, 0)
         thead = el("thead") if heads else None
         tbody = el("tbody")
         for r, row in enumerate(rows):
@@ -1512,7 +1562,7 @@ class _Rst:
         if bare in ("pep", "pep-reference", "rfc", "rfc-reference"):
             num, _, frag = text.partition("#")
             num = num.strip()
-            if not num.isdigit():
+            if not _digits(num):
                 m = re.match(r"^(.*?)\s*<(\d+)(#[^>]*)?>$", text)
                 if not m:
                     return [text]
@@ -1567,11 +1617,17 @@ class _Rst:
     # --- after the whole file is read -------------------------------------------------------------
     def resolve(self, body: ET.Element) -> None:
         parents = {c: p for p in body.iter() for c in p}
-        # substitutions (definitions can use others, a few rounds deep)
+        # substitutions (definitions can use others, a few rounds deep), within one budget for the
+        # file: definitions that each use the next ten times multiplied the text every round
+        budget = MAX_SUB_NODES
+        sizes: dict[str, int] = {}
         for _ in range(MAX_SUB_ROUNDS):
             subs = [e for e in body.iter("span") if e.get("data-rst-sub") is not None]
             if not subs:
                 break
+            # each parent's children are rebuilt once a round (replace_el per use was quadratic in a
+            # paragraph with many of them)
+            by_parent: dict[ET.Element, dict[ET.Element, list]] = {}
             for e in subs:
                 name = e.get("data-rst-sub")
                 nodes = self.subs.get(name)
@@ -1580,20 +1636,34 @@ class _Rst:
                 p = parents.get(e)
                 if p is None:
                     continue
+                if nodes is not None:
+                    if name not in sizes:
+                        sizes[name] = sum(1 + len(x) // 64 if isinstance(x, str) else
+                                          sum(1 + len(c.text or "") // 64 for c in x.iter()) for x in nodes)
+                    budget -= sizes[name]
+                    if budget < 0:
+                        if budget + sizes[name] >= 0:  # said once
+                            self.lost.append("Substitutions that grow without end were stopped; the rest are shown as |name|")
+                        nodes = None
                 if nodes is None:
-                    replace_el(p, e, [f"|{name}|"])
+                    by_parent.setdefault(p, {})[e] = [f"|{name}|"]
                     continue
                 fresh = [copy.deepcopy(x) if not isinstance(x, str) else x for x in nodes]
-                replace_el(p, e, fresh)
+                by_parent.setdefault(p, {})[e] = fresh
                 for x in fresh:
                     if not isinstance(x, str):
                         parents[x] = p
                         for c in x.iter():
                             for cc in c:
                                 parents[cc] = c
-        for e in list(body.iter("span")):
+            for p, reps in by_parent.items():
+                _splice(p, reps)
+        left: dict[ET.Element, dict[ET.Element, list]] = {}
+        for e in body.iter("span"):
             if e.get("data-rst-sub") is not None and e in parents:
-                replace_el(parents[e], e, [f"|{e.get('data-rst-sub')}|"])
+                left.setdefault(parents[e], {})[e] = [f"|{e.get('data-rst-sub')}|"]
+        for p, reps in left.items():
+            _splice(p, reps)
         self._resolve_notes(body, parents)
         anon_list = []
         for k, t in enumerate(self.anon_targets, 1):
@@ -1647,7 +1717,7 @@ class _Rst:
             unwrap(parent, a)
 
     def _resolve_notes(self, body: ET.Element, parents: dict) -> None:
-        manual = {lab for lab, _ in self.footnotes if lab.isdigit()}
+        manual = {lab for lab, _ in self.footnotes if _digits(lab)}
         used = {int(x) for x in manual}
         by_label: dict[str, ET.Element] = {}
         auto: list[ET.Element] = []
@@ -1655,7 +1725,7 @@ class _Rst:
         number: dict[int, str] = {}
         nxt = 1
         for k, (label, aside) in enumerate(self.footnotes):
-            if label.isdigit():
+            if _digits(label):
                 shown = str(int(label))
             elif label.startswith("#"):
                 while nxt in used:
@@ -1673,7 +1743,7 @@ class _Rst:
             aside.set("id", f"fn{shown}" if shown.isdigit() else f"fn-s{len(symbols)}")
             aside.set("data-label", shown)
             number[k] = shown
-            if label.isdigit():
+            if _digits(label):
                 by_label[str(int(label))] = aside
         auto_i = sym_i = 0
         for a in list(body.iter("a")):
@@ -1681,7 +1751,7 @@ class _Rst:
             if label is None:
                 continue
             del a.attrib["data-rst-fn"]
-            if label.isdigit():
+            if _digits(label):
                 aside = by_label.get(str(int(label)))
             elif label == "#":
                 aside = auto[auto_i] if auto_i < len(auto) else None
@@ -1768,6 +1838,17 @@ def _lines(text: str) -> list[str]:
     return [s.expandtabs(8).rstrip().replace("\f", " ").replace("\v", " ") for s in text.split("\n")]
 
 
+def _digits(s: str) -> bool:
+    """Plain ASCII digits int() takes ("²" passes str.isdigit(), and failed the whole book in int())."""
+    return s.isascii() and s.isdigit() and len(s) < 10
+
+
+def _int(s: str, default):
+    """A whole number written in an option or label (an optional sign, ASCII digits), else `default`."""
+    s = (s or "").strip()
+    return int(s) if re.fullmatch(r"[+-]?\d{1,9}", s, re.ASCII) else default
+
+
 def _dedent(lines: list[str]) -> list[str]:
     widths = [_indent(s) for s in lines if s.strip()]
     k = min(widths) if widths else 0
@@ -1830,8 +1911,8 @@ def _directive_parts(first: str, body: list[str], content_first: bool = False, m
 def _slice_lines(lines: list[str], opts: dict) -> list[str]:
     text_lines = lines
     if opts.get("start-line", "").lstrip("-").isdigit() or opts.get("end-line", "").lstrip("-").isdigit():
-        a = int(opts["start-line"]) if opts.get("start-line", "").lstrip("-").isdigit() else None
-        b = int(opts["end-line"]) if opts.get("end-line", "").lstrip("-").isdigit() else None
+        a = _int(opts.get("start-line", ""), None)
+        b = _int(opts.get("end-line", ""), None)
         text_lines = text_lines[a:b]
     for key, after in (("start-after", True), ("start-at", False)):
         if opts.get(key):

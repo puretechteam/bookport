@@ -9,6 +9,7 @@ from __future__ import annotations
 import struct
 import zlib
 from dataclasses import dataclass
+from itertools import accumulate
 
 from . import limits
 from .errors import BookportError
@@ -47,33 +48,58 @@ def png_info(data: bytes) -> dict:
     return {"width": w, "height": h, "depth": depth, "color": ctype, "interlace": interlace}
 
 
+_AND255 = (255).__and__
+
+
 def _unfilter(raw: bytes, width: int, height: int, bpp: int, row_bytes: int) -> bytearray:
+    if row_bytes == width * bpp and bpp <= 4 and len(raw) >= height * (row_bytes + 1):  # 8-bit samples
+        from .pdf.parser import _png_rows  # Pillow undoes the filters in C, when it's installed
+        fast = _png_rows(raw[:height * (row_bytes + 1)], bpp, width, row_bytes)
+        if fast is not None and len(fast) == height * row_bytes:
+            return bytearray(fast)
     out = bytearray(height * row_bytes)
-    prev = bytearray(row_bytes)
+    prev = bytes(row_bytes)
+    high = int.from_bytes(b"\x80" * row_bytes, "little")  # the top bit of every byte
+    low = ((1 << (8 * row_bytes)) - 1) ^ high
     pos = 0
     for y in range(height):
         ftype = raw[pos]
-        line = bytearray(raw[pos + 1:pos + 1 + row_bytes])
+        line = raw[pos + 1:pos + 1 + row_bytes]
         pos += 1 + row_bytes
-        if ftype == 1:
-            for i in range(bpp, row_bytes):
-                line[i] = (line[i] + line[i - bpp]) & 0xFF
-        elif ftype == 2:
-            for i in range(row_bytes):
-                line[i] = (line[i] + prev[i]) & 0xFF
+        if ftype == 1:  # Sub: a running sum of each channel (in C: accumulate and map)
+            line = bytearray(line)
+            for c in range(bpp):
+                line[c::bpp] = bytes(map(_AND255, accumulate(line[c::bpp])))
+        elif ftype == 2:  # Up: every byte added to the one above, at once, as one big number with no carries
+            a, b = int.from_bytes(line, "little"), int.from_bytes(prev, "little")
+            line = ((a & low) + (b & low) ^ ((a ^ b) & high)).to_bytes(row_bytes, "little")
         elif ftype == 3:
-            for i in range(row_bytes):
-                left = line[i - bpp] if i >= bpp else 0
-                line[i] = (line[i] + ((left + prev[i]) >> 1)) & 0xFF
+            line = list(line)
+            up = prev
+            for i in range(bpp):
+                line[i] = (line[i] + (up[i] >> 1)) & 0xFF
+            for i in range(bpp, row_bytes):
+                line[i] = (line[i] + ((line[i - bpp] + up[i]) >> 1)) & 0xFF
         elif ftype == 4:
-            for i in range(row_bytes):
-                a = line[i - bpp] if i >= bpp else 0
-                b = prev[i]
-                c = prev[i - bpp] if i >= bpp else 0
-                p = a + b - c
-                pa, pb, pc = abs(p - a), abs(p - b), abs(p - c)
-                pr = a if pa <= pb and pa <= pc else (b if pb <= pc else c)
-                line[i] = (line[i] + pr) & 0xFF
+            line = list(line)
+            up = prev
+            for i in range(bpp):
+                line[i] = (line[i] + up[i]) & 0xFF  # no left or upper left: Paeth picks the byte above
+            for i in range(bpp, row_bytes):
+                a = line[i - bpp]
+                b = up[i]
+                c = up[i - bpp]
+                pa = b - c  # |p - a| with p = a + b - c
+                pb = a - c
+                pc = pa + pb
+                if pa < 0:
+                    pa = -pa
+                if pb < 0:
+                    pb = -pb
+                if pc < 0:
+                    pc = -pc
+                line[i] = (line[i] + (a if pa <= pb and pa <= pc else b if pb <= pc else c)) & 0xFF
+        line = bytes(line)
         out[y * row_bytes:(y + 1) * row_bytes] = line
         prev = line
     return out
@@ -355,7 +381,7 @@ def decode(data: bytes) -> Raster | None:
             if im.mode not in ("L", "LA", "RGB", "RGBA"):
                 im = im.convert("RGBA" if "A" in im.mode or "transparency" in im.info else "RGB")
             return Raster(im.width, im.height, im.mode, im.tobytes())
-        except Exception:  # noqa: BLE001 - Pillow raises many kinds of errors on bad images
+        except Exception:
             return None
     return None
 
@@ -370,9 +396,6 @@ def flatten_alpha(r: Raster, background=(255, 255, 255)) -> tuple[Raster, bytes 
     """Split alpha off: (color raster, alpha bytes or None)."""
     if r.mode in ("L", "RGB"):
         return r, None
-    c = r.channels
-    color = bytearray()
-    alpha = bytearray()
     px = r.pixels
     n = r.width * r.height
     if r.mode == "LA":
@@ -384,7 +407,6 @@ def flatten_alpha(r: Raster, background=(255, 255, 255)) -> tuple[Raster, bytes 
     color[1::3] = px[1::4]
     color[2::3] = px[2::4]
     alpha = px[3::4]
-    del c
     if all(a == 255 for a in alpha[:: max(1, len(alpha) // 4096)]) and alpha.count(255) == len(alpha):
         return Raster(r.width, r.height, "RGB", bytes(color)), None
     return Raster(r.width, r.height, "RGB", bytes(color)), bytes(alpha)

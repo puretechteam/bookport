@@ -199,7 +199,6 @@ class Layer:
         self.delay = 0
         self.half = False
         self.color = False
-        self.ended = False
 
     def add(self, data: bytes) -> None:
         if len(data) < 2:
@@ -246,7 +245,7 @@ class Layer:
                 if not more:
                     break
         except EndOfData:  # what was decoded so far stands, as in the reference decoder
-            self.ended = True
+            pass
 
     def image(self) -> tuple[int, int, str, bytes]:
         w, h = self.width, self.height

@@ -2,7 +2,6 @@
 
 from __future__ import annotations
 
-import io
 import posixpath
 import zipfile
 
@@ -33,8 +32,7 @@ def read(path) -> Book:
 
 def write(book: Book, path, **_) -> None:
     text, images = markdown.book_to_markdown(book)
-    buf = io.BytesIO()
-    with zipfile.ZipFile(buf, "w", zipfile.ZIP_DEFLATED) as z:
+    with zipfile.ZipFile(path, "w", zipfile.ZIP_DEFLATED) as z:  # straight to the file, not in memory first
         z.writestr("index.txt", text)
         for href, name in images.items():
             if href in book.resources:
@@ -45,5 +43,3 @@ def write(book: Book, path, **_) -> None:
             cover_name = "cover" + posixpath.splitext(cov.href)[1]
             z.writestr(cover_name, cov.data)
         z.writestr("metadata.opf", metadata_opf(book, cover_name))
-    with open(path, "wb") as f:
-        f.write(buf.getvalue())

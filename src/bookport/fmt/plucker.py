@@ -60,7 +60,7 @@ def read_plucker(pdb, title: str) -> Book:
                 pos += s
             if pos < len(body):
                 pieces.append(body[pos:])
-            texts[uid] = b"\x00\x38".join(pieces) if sum(sizes) == len(body) or pos <= len(body) else body
+            texts[uid] = b"\x00\x38".join(pieces) if pos <= len(body) else body
         elif kind in (IMAGE, IMAGE_COMPRESSED):
             body = rec[8:]
             try:

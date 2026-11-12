@@ -87,6 +87,7 @@ class LrfObject:
         self.links: list[int] = []
         self.stream = b""
         self.stream_flags = 0
+        self._data: bytes | None = None
         for low, param, _p in tags(data, 8):
             if low == 0x01:
                 break
@@ -102,12 +103,15 @@ class LrfObject:
         return next((p for t, p in self.tags if t == low), None)
 
     def data(self) -> bytes:
+        if self._data is not None:
+            return self._data
         s = self.stream
         if self.stream_flags & 0x100 and len(s) > 4:
             try:
                 s = limits.inflate(s[4:])
             except zlib.error:
-                return b""
+                s = b""
+        self._data = s  # unpacked once, however many links lead here
         return s
 
 
@@ -189,6 +193,13 @@ def read(path) -> Book:
         return images[img_id]
 
     anchor_of: dict[tuple[int, int], str] = {}
+    placed: set[int] = set()
+    shown: set[int] = set()  # each text object once: a page linking one block 10,000 times isn't 10,000 copies
+
+    def text_once(t):
+        if t.id not in shown:
+            shown.add(t.id)
+            _text(t.data(), body, objs, image)
     for n, pid in enumerate(page_ids, 1):
         page = objs.get(pid)
         if page is None:
@@ -201,15 +212,16 @@ def read(path) -> Book:
             if low != 0x03 or len(param) != 4:
                 continue
             block = objs.get(struct.unpack("<I", param)[0])
-            if block is None:
+            if block is None or block.id in placed:
                 continue
+            placed.add(block.id)
             ET.SubElement(body, "a", {"id": f"obj{block.id}"})
             anchor_of[(pid, block.id)] = f"{href}#obj{block.id}"
             targets = [block] + [objs[i] for i in _stream_links(block) if i in objs]
             for t in targets:
                 if t.type == 0x0A:
                     anchor_of[(pid, t.id)] = f"{href}#obj{block.id}"
-                    _text(t.data(), body, objs, image)
+                    text_once(t)
                 elif t.type == 0x0C:
                     src = image(t.id)
                     if src:
@@ -227,7 +239,7 @@ def read(path) -> Book:
                             for k in _stream_links(o):
                                 inner = objs.get(k)
                                 if inner is not None and inner.type == 0x0A:
-                                    _text(inner.data(), body, objs, image)
+                                    text_once(inner)
         book.add_document(href, root_el)
     toc_obj = next((o for o in objs.values() if o.type == 0x1E), None)
     if toc_obj is not None:
@@ -465,24 +477,31 @@ def write(book: Book, path, **_) -> None:
     w.put(root_id, 0x1C, b"".join([_u32(0x7B, tree_id), _u16(0x76, 0), _u16(0x77, 1), _u16(0x79, 2), _u16(0x7A, 0x10),
                                     _u16(0xDA, 2), _u16(0x75, 1), _u32(0x78, 0), _string(0x16, FONT)]))
     # header, info and thumbnail
-    info = ('﻿<?xml version="1.0" encoding="utf-8"?>\n<Info version="1.1">\n<BookInfo>\n'
-            f"<Title reading=\"\">{markup.escape(md.title)}</Title>\n"
-            f"<Author reading=\"{markup._esc_attr(md.author_sort or '')}\">{markup.escape(' & '.join(md.authors))}</Author>\n"
-            f"<BookID>{markup.escape(md.uid().replace('-', '')[:32])}</BookID>\n"
-            f"<Publisher reading=\"\">{markup.escape(md.publisher)}</Publisher>\n<Label reading=\"\" />\n"
-            f"<Category>{markup.escape(', '.join(md.subjects))}</Category>\n<Classification />\n"
-            f"<FreeText>{markup.escape(re.sub(r'<[^>]+>', '', md.description))}</FreeText>\n</BookInfo>\n<DocInfo>\n"
-            f"<Language>{markup.escape(md.language or 'en')}</Language>\n<Creator />\n"
-            f"<CreationDate>{markup.escape(md.date[:10])}</CreationDate>\n<Producer>bookport</Producer>\n"
-            "<Page>0</Page>\n</DocInfo>\n</Info>\n").encode()
-    info_z = struct.pack("<I", len(info)) + zlib.compress(info, 9)
+    def info_block(free_text):
+        info = ('﻿<?xml version="1.0" encoding="utf-8"?>\n<Info version="1.1">\n<BookInfo>\n'
+                f"<Title reading=\"\">{markup.escape(md.title)}</Title>\n"
+                f"<Author reading=\"{markup._esc_attr(md.author_sort or '')}\">{markup.escape(' & '.join(md.authors))}</Author>\n"
+                f"<BookID>{markup.escape(md.uid().replace('-', '')[:32])}</BookID>\n"
+                f"<Publisher reading=\"\">{markup.escape(md.publisher)}</Publisher>\n<Label reading=\"\" />\n"
+                f"<Category>{markup.escape(', '.join(md.subjects))}</Category>\n<Classification />\n"
+                f"<FreeText>{markup.escape(free_text)}</FreeText>\n</BookInfo>\n<DocInfo>\n"
+                f"<Language>{markup.escape(md.language or 'en')}</Language>\n<Creator />\n"
+                f"<CreationDate>{markup.escape(md.date[:10])}</CreationDate>\n<Producer>bookport</Producer>\n"
+                "<Page>0</Page>\n</DocInfo>\n</Info>\n").encode()
+        return struct.pack("<I", len(info)) + zlib.compress(info, 9)
+    free_text = re.sub(r"<[^>]+>", "", md.description)
+    info_z = info_block(free_text)
+    while len(info_z) > 0xFFFF and free_text:  # the header keeps the packed info's size in 16 bits
+        free_text = free_text[:len(free_text) // 2].rstrip()
+        info_z = info_block(free_text + "…" if free_text else "")
+    if len(info_z) > 0xFFFF:
+        raise BookportError("This book's title, authors and subjects are too long for an LRF info block")
     thumb = b""
     thumb_type = 0
     cover = book.cover_image()
     if cover is not None and cover.media_type in ("image/jpeg", "image/png", "image/gif"):
         thumb = cover.data
         thumb_type = {"image/jpeg": 0x11, "image/png": 0x12, "image/gif": 0x14}[cover.media_type]
-    header_len = 0x58
     pos = 0x54 + len(info_z) + len(thumb)
     pos += (16 - pos % 16) % 16
     body = bytearray()
@@ -499,7 +518,6 @@ def write(book: Book, path, **_) -> None:
     toc_off = next(off for oid, off, _s in index if oid == toc_id)
     header += struct.pack("<II", toc_id, toc_off)
     header += struct.pack("<HHI", len(info_z), thumb_type, len(thumb))
-    del header_len
     out = bytes(header) + info_z + thumb
     out += b"\0" * (pos - len(out))
     out += bytes(body)
