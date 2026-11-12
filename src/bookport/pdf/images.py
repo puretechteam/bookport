@@ -64,7 +64,7 @@ def embed(writer: Writer, data: bytes) -> tuple[Ref, int, int] | None:
             return writer.stream(idat, d, compress=False), info["width"], info["height"]
     try:
         r = imgmod.decode(data)
-    except Exception:
+    except Exception:  # noqa: BLE001 - a broken image is left out, never fatal
         r = None
     if r is None:
         return None

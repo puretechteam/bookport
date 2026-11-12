@@ -1166,7 +1166,7 @@ class Writer:
     def _flat(self, index: int, shown: tuple[float, float]) -> str | None:
         try:
             got = self.flatten(index, FLATTEN_DPI)
-        except Exception:
+        except Exception:  # noqa: BLE001 - no flattened page: it's drawn as it is
             return None
         if not got:
             return None

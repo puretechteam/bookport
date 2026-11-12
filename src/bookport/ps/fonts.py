@@ -429,7 +429,7 @@ def _load_sfnt(parts: list[bytes]):
     for data in (b"".join(p[:-1] if len(p) % 2 else p for p in parts), b"".join(parts)):
         try:
             return _tolerant_load(data)
-        except Exception:
+        except Exception:  # noqa: BLE001, S112 - a damaged font: try the other way
             continue
     return None
 
@@ -437,7 +437,7 @@ def _load_sfnt(parts: list[bytes]):
 def _tolerant_load(data: bytes):
     try:
         return ttf.load(data)
-    except Exception:
+    except Exception:  # noqa: BLE001, S110 - damaged: try it repaired below
         pass
     num = struct.unpack(">H", data[4:6])[0]
     tables = {}

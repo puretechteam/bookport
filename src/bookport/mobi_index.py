@@ -13,7 +13,7 @@ from .palm import encode_vwi_forward, vwi_forward
 
 
 def _bits(x: int) -> int:
-    return x.bit_count() if hasattr(x, "bit_count") else bin(x).count("1")
+    return x.bit_count() if hasattr(x, "bit_count") else bin(x).count("1")  # noqa: FURB161
 
 
 def parse_tagx(rec: bytes, start: int):

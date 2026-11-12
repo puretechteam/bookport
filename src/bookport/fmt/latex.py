@@ -1497,7 +1497,7 @@ class _Reader:
         self.text(accent(name, base))
 
     def today(self, name: str) -> None:
-        d = date.today()
+        d = date.today()  # noqa: DTZ011 - \today is the local date, as LaTeX prints it
         self.text(f"{d:%B} {d.day}, {d.year}")
 
     def enquote(self, name: str) -> None:

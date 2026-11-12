@@ -82,7 +82,7 @@ def main(argv=None) -> int:
     except OSError as e:
         print(f"bookport: {e}", file=sys.stderr)
         return 1
-    except Exception as e:
+    except Exception as e:  # noqa: BLE001 - a bug in bookport: a message, not a traceback
         print(f"bookport: unexpected error ({type(e).__name__}: {e}); please report it with the book that caused it",
               file=sys.stderr)
         return 1

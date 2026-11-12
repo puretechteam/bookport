@@ -1405,7 +1405,7 @@ def _pil_decode(data: bytes, kind: str):
     try:
         im = Image.open(io.BytesIO(data))
         im.load()
-    except Exception:
+    except Exception:  # noqa: BLE001 - a picture Pillow can't read is left out
         return None
     if im.mode not in ("L", "RGB", "CMYK"):
         im = im.convert("RGB")
@@ -1443,7 +1443,7 @@ def _ccitt(data: bytes, parms: dict, w: int, h: int) -> bytes | None:
         im = Image.open(io.BytesIO(tiff))
         im.load()
         im = im.convert("1")
-    except Exception:
+    except Exception:  # noqa: BLE001 - a picture Pillow can't read is left out
         return None
     # PDF's samples: 0 is black unless BlackIs1 (Pillow gives 0 for black)
     raw = im.tobytes()

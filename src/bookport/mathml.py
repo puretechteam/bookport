@@ -216,7 +216,7 @@ INTEGRALS = set("∫∬∭⨌∮∯∰")  # scripts at the side even in display
 BIG_CHARS = set(TEX_BIG.values())
 
 FUNCTIONS = set("""arccos arcsin arctan arg cos cosh cot coth csc deg det dim exp gcd hom inf ker lg lim liminf limsup ln
-log max min Pr sec sin sinh sup tan tanh injlim projlim""".split())
+log max min Pr sec sin sinh sup tan tanh injlim projlim""".split())  # noqa: SIM905
 LIMIT_FUNCTIONS = {"det", "gcd", "inf", "lim", "liminf", "limsup", "max", "min", "Pr", "sup", "injlim", "projlim"}
 
 SPACES = {",": "0.167em", "thinspace": "0.167em", ":": "0.222em", ">": "0.222em", "medspace": "0.222em",
@@ -2516,7 +2516,7 @@ omicron pi rho sigma tau upsilon phi phi.alt chi psi omega Gamma Delta Theta Lam
 infinity partial nabla ell aleph emptyset sum product integral integral.double integral.triple integral.cont union.big
 sect.big arrow.r arrow.l arrow.l.r arrow.r.double arrow.l.double arrow.l.r.double arrow.r.bar arrow.t arrow.b lt.eq
 gt.eq eq.not approx equiv in in.not subset subset.eq supset supset.eq union sect times div plus.minus minus.plus
-dot.op forall exists not and or dots.h dots.c dots.v dots.down prime""".split())
+dot.op forall exists not and or dots.h dots.c dots.v dots.down prime""".split())  # noqa: SIM905
 TYPST_NAME = {v: k for k, v in reversed(list(TYPST_SYM.items())) if k in _TYPST_STABLE}
 TYPST_NAME.update({"−": "-", "/": "\\/", "_": "\\_", "^": "\\^", "&": "\\&", "#": "\\#", "$": "\\$",
                    "\\": "backslash", "\"": "\\\"", "′": "prime", "∂": "partial", "∞": "infinity", "∅": "emptyset",

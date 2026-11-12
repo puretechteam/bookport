@@ -27,7 +27,7 @@ classifiers = [
 
 [project.optional-dependencies]
 images = ["pillow>=10"]
-dev = ["pytest>=8", "ruff>=0.16,<0.17", "pymupdf>=1.24", "pillow>=10", "fonttools>=4.50"]  # PyMuPDF and fontTools: independent readers to check output against
+dev = ["pytest>=8", "ruff>=0.16,<0.17", "pymupdf>=1.24", "pillow>=10", "fonttools>=4.50", "numpy>=1.24"]  # PyMuPDF and fontTools: independent readers to check output against; numpy compares pictures
 
 [project.scripts]
 bookport = "bookport.__main__:main"

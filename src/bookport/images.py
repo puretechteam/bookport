@@ -381,7 +381,7 @@ def decode(data: bytes) -> Raster | None:
             if im.mode not in ("L", "LA", "RGB", "RGBA"):
                 im = im.convert("RGBA" if "A" in im.mode or "transparency" in im.info else "RGB")
             return Raster(im.width, im.height, im.mode, im.tobytes())
-        except Exception:
+        except Exception:  # noqa: BLE001 - Pillow raises many kinds of errors on bad images
             return None
     return None
 
